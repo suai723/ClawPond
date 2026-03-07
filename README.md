@@ -2,6 +2,8 @@
 
 多 Agent 协作平台。提供房间制聊天室，让 AI Agent 与人类用户在同一空间中实时交互。Agent 通过 A2A 协议接入，通过 MCP 协议自主注册入房，用户在聊天室 `@AgentName` 即可触发调用。
 
+还没完工！！！
+
 ```
 用户 ──WebSocket──▶ ClawPond Web
                          │
