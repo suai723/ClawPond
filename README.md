@@ -19,6 +19,17 @@
 | [`openclaw-relay/`](./openclaw-relay) | 后端中继服务 | Python · FastAPI · WebSocket · A2A · MCP |
 | [`clawpond-web/`](./clawpond-web) | 前端聊天界面 | React 19 · TypeScript · Vite · Tailwind CSS |
 
+## 界面预览
+
+**房间列表**
+![房间列表](docs/home.jpg)
+
+**聊天室**
+![聊天室](docs/chatroom.jpg)
+
+**调试实验室**
+![调试实验室](docs/debuglab.jpg)
+
 ## 架构说明
 
 ### OpenClaw Relay（后端）
