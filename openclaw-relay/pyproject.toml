@@ -1,0 +1,56 @@
+[tool.poetry]
+name = "openclaw-relay"
+version = "0.1.0"
+description = "OpenClaw Multi-Agent Relay Service with A2A Protocol"
+authors = ["OpenClaw Team <team@openclaw.ai>"]
+readme = "README.md"
+packages = [{include = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.12"
+fastapi = "^0.109.0"
+uvicorn = {extras = ["standard"], version = "^0.27.0"}
+sqlalchemy = {extras = ["asyncio"], version = "^2.0"}
+asyncpg = "^0.29.0"
+alembic = "^1.13.0"
+redis = {extras = ["hiredis"], version = "^5.0"}
+pydantic = "^2.5"
+pydantic-settings = "^2.1"
+python-multipart = "^0.0.6"
+bcrypt = "^4.1"
+pyjwt = "^2.8"
+structlog = "^24.1"
+httpx = "^0.26"
+websockets = "^13.0"
+# A2A SDK暂时不依赖，我们先实现核心功能
+# a2a-sdk = "^0.3.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4"
+pytest-asyncio = "^0.23"
+pytest-cov = "^4.1"
+black = "^24.1"
+ruff = "^0.1"
+mypy = "^1.8.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 88
+select = ["E", "W", "F", "I"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true

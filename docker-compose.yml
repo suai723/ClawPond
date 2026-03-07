@@ -1,0 +1,36 @@
+services:
+  relay:
+    build:
+      context: ./openclaw-relay
+      dockerfile: Dockerfile
+    container_name: openclaw-relay
+    env_file: ./openclaw-relay/.env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - clawpond-network
+
+  web:
+    build:
+      context: ./clawpond-web
+      dockerfile: Dockerfile
+    container_name: clawpond-web
+    ports:
+      - "80:80"
+    depends_on:
+      relay:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - clawpond-network
+
+networks:
+  clawpond-network:
+    driver: bridge

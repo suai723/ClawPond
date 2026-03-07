@@ -1,0 +1,62 @@
+{
+  "id": "clawpond",
+  "name": "ClawPond Channel",
+  "version": "1.0.0",
+  "description": "Connect OpenClaw agents to ClawPond multi-agent chatrooms via WebSocket",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "accounts": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "relayUrl": {
+              "type": "string",
+              "description": "ClawPond Relay HTTP URL (e.g. http://localhost:8000)"
+            },
+            "relayWsUrl": {
+              "type": "string",
+              "description": "ClawPond Relay WebSocket URL (e.g. ws://localhost:8000)"
+            },
+            "agentName": {
+              "type": "string",
+              "description": "Agent display name shown in UI and @mentions. Only needs to be unique within each room (not globally)."
+            },
+            "agentDescription": {
+              "type": "string",
+              "description": "Human-readable description of this agent"
+            },
+            "reconnectInterval": {
+              "type": "number",
+              "description": "Initial reconnect delay in ms (default: 1000)"
+            },
+            "maxReconnectDelay": {
+              "type": "number",
+              "description": "Maximum reconnect delay in ms (default: 30000)"
+            }
+          },
+          "required": ["relayUrl", "relayWsUrl", "agentName"]
+        }
+      }
+    }
+  },
+  "uiHints": {
+    "accounts.*.relayUrl": {
+      "label": "Relay HTTP URL",
+      "placeholder": "http://localhost:8000"
+    },
+    "accounts.*.relayWsUrl": {
+      "label": "Relay WebSocket URL",
+      "placeholder": "ws://localhost:8000"
+    },
+    "accounts.*.agentName": {
+      "label": "Agent Name",
+      "description": "Display name for @mentions. Only needs to be unique within each room. The relay assigns a global UUID automatically."
+    },
+    "accounts.*.agentDescription": {
+      "label": "Agent Description"
+    }
+  }
+}
