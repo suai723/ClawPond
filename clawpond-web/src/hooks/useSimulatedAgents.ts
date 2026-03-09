@@ -23,7 +23,10 @@ export interface SimulatedAgent {
   username: string
   userType: 'human' | 'agent'
   color: string
+  /** 仅用于 UI 展示（房间名查找） */
   roomId: string | null
+  /** 用于 WS 连接和离开操作的 access_token */
+  roomPassword: string | null
   status: AgentStatus
   inputText: string
   agentId?: string  // 加入房间后由后端分配
@@ -85,11 +88,21 @@ export function useSimulatedAgents() {
     setFeed((prev) => [...prev, { kind: 'event', data: evt }])
   }, [])
 
-  const updateAgentStatus = useCallback((localId: string, status: AgentStatus, roomId?: string | null) => {
+  const updateAgentStatus = useCallback((
+    localId: string,
+    status: AgentStatus,
+    roomId?: string | null,
+    roomPassword?: string | null,
+  ) => {
     setAgents((prev) =>
       prev.map((a) =>
         a.localId === localId
-          ? { ...a, status, ...(roomId !== undefined ? { roomId } : {}) }
+          ? {
+              ...a,
+              status,
+              ...(roomId !== undefined ? { roomId } : {}),
+              ...(roomPassword !== undefined ? { roomPassword } : {}),
+            }
           : a,
       ),
     )
@@ -109,6 +122,7 @@ export function useSimulatedAgents() {
       userType,
       color: nextColor(),
       roomId: null,
+      roomPassword: null,
       status: 'idle',
       inputText: '',
     }
@@ -136,10 +150,10 @@ export function useSimulatedAgents() {
       wsClientsRef.current.delete(localId)
     }
 
-    updateAgentStatus(localId, 'connecting', roomId)
+    updateAgentStatus(localId, 'connecting', roomId, password)
 
     try {
-      await apiJoinRoom(roomId, {
+      await apiJoinRoom({
         user_id: agent.userId,
         username: agent.username,
         password,
@@ -158,7 +172,7 @@ export function useSimulatedAgents() {
       return
     }
 
-    const ws = new ChatWebSocket(roomId, agent.userId, agent.username, agent.userType)
+    const ws = new ChatWebSocket(password, agent.userId, agent.username, agent.userType)
 
     ws.onStatus((status) => {
       if (status === 'connected') {
@@ -237,7 +251,7 @@ export function useSimulatedAgents() {
 
   const leaveRoom = useCallback(async (localId: string) => {
     const agent = agents.find((a) => a.localId === localId)
-    if (!agent || !agent.roomId) return
+    if (!agent || !agent.roomPassword) return
 
     const ws = wsClientsRef.current.get(localId)
     if (ws) {
@@ -246,12 +260,12 @@ export function useSimulatedAgents() {
     }
 
     try {
-      await apiLeaveRoom(agent.roomId, agent.userId)
+      await apiLeaveRoom(agent.roomPassword, agent.userId)
     } catch (err) {
       console.warn(`[DebugLab] ${agent.username} 离开房间时出错`, err)
     }
 
-    updateAgentStatus(localId, 'idle', null)
+    updateAgentStatus(localId, 'idle', null, null)
   }, [agents, updateAgentStatus])
 
   const sendMessage = useCallback((localId: string, text: string, mentions: MentionTarget[] = []) => {

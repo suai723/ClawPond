@@ -8,6 +8,8 @@ import MemberSidebar from '../components/MemberSidebar'
 
 interface ChatRoomProps {
   roomId: string
+  /** 房间 access_token，用于 WS 连接和消息操作 */
+  roomPassword: string
   userId: string
   username: string
   onLeave: () => void
@@ -15,7 +17,7 @@ interface ChatRoomProps {
 
 type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'error'
 
-export default function ChatRoom({ roomId, userId, username, onLeave }: ChatRoomProps) {
+export default function ChatRoom({ roomId, roomPassword, userId, username, onLeave }: ChatRoomProps) {
   const [messages, setMessages] = useState<Message[]>([])
   const [onlineMembers, setOnlineMembers] = useState<OnlineMember[]>([])
   const [room, setRoom] = useState<Room | null>(null)
@@ -29,21 +31,21 @@ export default function ChatRoom({ roomId, userId, username, onLeave }: ChatRoom
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [])
 
-  // 加载房间信息
+  // 加载房间信息（仍使用 room_id，此为公开端点）
   useEffect(() => {
     getRoom(roomId).catch(console.error).then((r) => r && setRoom(r))
   }, [roomId])
 
-  // 加载历史消息
+  // 加载历史消息（使用 roomPassword 作为 access_token）
   useEffect(() => {
-    getMessages(roomId, 50).then((data) => {
+    getMessages(roomPassword, 50).then((data) => {
       setMessages(data.messages)
     }).catch(console.error)
-  }, [roomId])
+  }, [roomPassword])
 
-  // WebSocket 连接
+  // WebSocket 连接（使用 roomPassword 定位房间）
   useEffect(() => {
-    const ws = new ChatWebSocket(roomId, userId, username, 'human')
+    const ws = new ChatWebSocket(roomPassword, userId, username, 'human')
     wsRef.current = ws
 
     const unsubStatus = ws.onStatus(setStatus)
@@ -88,7 +90,7 @@ export default function ChatRoom({ roomId, userId, username, onLeave }: ChatRoom
       ws.disconnect()
       wsRef.current = null
     }
-  }, [roomId, userId, username, scrollToBottom])
+  }, [roomPassword, userId, username, scrollToBottom])
 
   useEffect(() => {
     scrollToBottom()

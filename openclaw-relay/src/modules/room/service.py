@@ -1,5 +1,6 @@
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from uuid import UUID, uuid4
+import secrets
 import bcrypt
 import structlog
 from datetime import datetime
@@ -18,31 +19,35 @@ class RoomService:
         self.repository = PGRoomRepository()
     
     async def create_room(
-        self, 
-        data: RoomCreate, 
-        creator_id: str, 
-        creator_username: str
-    ) -> Room:
-        """创建房间"""
+        self,
+        data: RoomCreate,
+        creator_id: str,
+        creator_username: str,
+    ) -> Tuple[Room, str]:
+        """创建房间，返回 (Room, plain_token)。plain_token 为一次性明文密码。"""
         logger.info("create_room", name=data.name, creator=creator_id)
-        
+
         # 检查房间名是否已存在
         existing = await self.repository.get_by_name(data.name)
         if existing:
             logger.warning("room_already_exists", name=data.name)
             raise ValueError(f"Room '{data.name}' already exists")
-        
-        # 加密密码
+
+        # 服务端生成随机 access_token（URL 安全，22 位）
+        plain_token = secrets.token_urlsafe(16)
+
+        # bcrypt hash 仅用于兼容旧有 validate_access 逻辑（可选保留）
         password_hash = bcrypt.hashpw(
-            data.password.encode('utf-8'), 
+            plain_token.encode('utf-8'),
             bcrypt.gensalt()
         ).decode('utf-8')
-        
+
         # 创建房间
         room = Room(
             id=uuid4(),
             name=data.name,
             password_hash=password_hash,
+            access_token=plain_token,
             created_by=creator_id,
             description=data.description,
             max_members=data.max_members,
@@ -51,20 +56,20 @@ class RoomService:
             allow_media_upload=data.allow_media_upload,
             media_max_size=data.media_max_size,
         )
-        
+
         room = await self.repository.create(room)
         logger.info("room_created", room_id=room.id, name=room.name)
-        
-        # 创建者自动成为owner
+
+        # 创建者自动成为 owner
         await self.add_member(
             room.id,
             creator_id,
             creator_username,
             UserType.HUMAN,
-            MemberRole.OWNER
+            MemberRole.OWNER,
         )
-        
-        return room
+
+        return room, plain_token
     
     async def get_room(self, room_id: UUID) -> Optional[Room]:
         """获取房间"""
@@ -140,16 +145,25 @@ class RoomService:
         
         return await self.repository.delete(room_id)
     
+    async def get_room_by_password(self, password: str) -> Optional[Room]:
+        """通过 access_token（密码）查找房间，找不到返回 None"""
+        return await self.repository.get_by_access_token(password)
+
     async def validate_access(self, room_id: UUID, password: str) -> bool:
-        """验证房间访问权限"""
+        """验证房间访问权限（兼容旧接口，优先用 access_token 精确匹配）"""
         room = await self.get_room(room_id)
         if not room:
             return False
-        
+
+        # 优先用 access_token 精确比较（新方式）
+        if room.access_token:
+            return room.access_token == password
+
+        # 回退到 bcrypt（存量数据兼容）
         try:
             return bcrypt.checkpw(
-                password.encode('utf-8'), 
-                room.password_hash.encode('utf-8')
+                password.encode('utf-8'),
+                room.password_hash.encode('utf-8'),
             )
         except Exception as e:
             logger.error("password_check_failed", room_id=room_id, error=str(e))
@@ -163,7 +177,7 @@ class RoomService:
         """加入房间"""
         logger.info("join_room", room_id=room_id, user_id=data.user_id, username=data.username)
         
-        # 验证房间密码
+        # 验证房间 access_token
         if not await self.validate_access(room_id, data.password):
             logger.warning("invalid_password", room_id=room_id, user_id=data.user_id)
             raise ValueError("Invalid room password")

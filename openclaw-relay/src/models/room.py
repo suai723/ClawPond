@@ -14,6 +14,7 @@ class RoomModel(Base):
     name = Column(String(100), nullable=False, unique=True, index=True)
     description = Column(String(500), nullable=True)
     password_hash = Column(String(255), nullable=False)
+    access_token = Column(String(64), nullable=False, unique=True, index=True)
     status = Column(String(20), nullable=False, default="active")
     created_by = Column(String(255), nullable=False)
     max_members = Column(Integer, nullable=False, default=50)

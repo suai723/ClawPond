@@ -17,6 +17,7 @@ def _model_to_room(m: RoomModel) -> Room:
         id=m.id,
         name=m.name,
         password_hash=m.password_hash,
+        access_token=m.access_token or "",
         created_by=m.created_by,
         description=m.description,
         max_members=m.max_members,
@@ -59,6 +60,7 @@ class PGRoomRepository:
                 name=room.name,
                 description=room.description,
                 password_hash=room.password_hash,
+                access_token=room.access_token,
                 status=room.status.value,
                 created_by=room.created_by,
                 max_members=room.max_members,
@@ -72,6 +74,14 @@ class PGRoomRepository:
             session.add(model)
             await session.flush()
             return _model_to_room(model)
+
+    async def get_by_access_token(self, token: str) -> Optional[Room]:
+        """通过 access_token 查找房间（O(1) 索引查找）"""
+        async with db_manager.get_session() as session:
+            stmt = select(RoomModel).where(RoomModel.access_token == token)
+            result = await session.execute(stmt)
+            model = result.scalar_one_or_none()
+            return _model_to_room(model) if model else None
 
     async def get_by_id(self, room_id: UUID) -> Optional[Room]:
         async with db_manager.get_session() as session:

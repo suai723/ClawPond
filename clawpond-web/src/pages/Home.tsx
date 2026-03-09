@@ -1,26 +1,19 @@
 import { useState, useEffect, useCallback } from 'react'
-import { listRooms, createRoom, joinRoom, getRoomMembers } from '../services/api'
+import { listRooms, createRoom, joinRoom } from '../services/api'
 import type { Room } from '../types'
 
 interface HomeProps {
-  onEnterRoom: (roomId: string, userId: string, username: string) => void
+  userId: string
+  username: string
+  onEnterRoom: (roomId: string, roomPassword: string) => void
   onOpenDebugLab: () => void
+  onLogout: () => void
 }
 
-export default function Home({ onEnterRoom, onOpenDebugLab }: HomeProps) {
+export default function Home({ userId, username, onEnterRoom, onOpenDebugLab, onLogout }: HomeProps) {
   const [rooms, setRooms] = useState<Room[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-
-  // 登录表单
-  const [username, setUsername] = useState(() => localStorage.getItem('cp_username') ?? '')
-  const [userId] = useState(() => {
-    const stored = localStorage.getItem('cp_user_id')
-    if (stored) return stored
-    const id = `user-${Date.now()}`
-    localStorage.setItem('cp_user_id', id)
-    return id
-  })
 
   // 加入房间弹窗
   const [joinModal, setJoinModal] = useState<{ roomId: string; roomName: string } | null>(null)
@@ -33,32 +26,21 @@ export default function Home({ onEnterRoom, onOpenDebugLab }: HomeProps) {
   const [createForm, setCreateForm] = useState({
     name: '',
     description: '',
-    password: '',
     max_members: 50,
   })
   const [createError, setCreateError] = useState('')
   const [creating, setCreating] = useState(false)
 
+  // 一次性密码展示弹窗（创建房间后显示）
+  const [newRoomSecret, setNewRoomSecret] = useState<{
+    roomId: string
+    roomName: string
+    plainPassword: string
+  } | null>(null)
+  const [passwordCopied, setPasswordCopied] = useState(false)
+  const [roomIdCopied, setRoomIdCopied] = useState(false)
+
   const [searchQuery, setSearchQuery] = useState('')
-
-  const [roomOnlineCounts, setRoomOnlineCounts] = useState<
-    Record<string, { humans: number; agents: number }>
-  >({})
-
-  const fetchOnlineCounts = useCallback(async (rooms: Room[]) => {
-    const results = await Promise.allSettled(rooms.map((r) => getRoomMembers(r.id)))
-    const counts: Record<string, { humans: number; agents: number }> = {}
-    results.forEach((result, i) => {
-      if (result.status === 'fulfilled') {
-        const online = result.value.filter((m) => m.status === 'online')
-        counts[rooms[i].id] = {
-          humans: online.filter((m) => m.user_type === 'human').length,
-          agents: online.filter((m) => m.user_type === 'agent').length,
-        }
-      }
-    })
-    setRoomOnlineCounts(counts)
-  }, [])
 
   const fetchRooms = useCallback(async () => {
     setLoading(true)
@@ -66,38 +48,18 @@ export default function Home({ onEnterRoom, onOpenDebugLab }: HomeProps) {
     try {
       const data = await listRooms()
       setRooms(data.rooms)
-      fetchOnlineCounts(data.rooms)
     } catch {
       setError('无法加载房间列表，请检查后端服务是否运行')
     } finally {
       setLoading(false)
     }
-  }, [fetchOnlineCounts])
+  }, [])
 
   useEffect(() => {
     fetchRooms()
   }, [fetchRooms])
 
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setRooms((prev) => {
-        if (prev.length > 0) fetchOnlineCounts(prev)
-        return prev
-      })
-    }, 30000)
-    return () => clearInterval(timer)
-  }, [fetchOnlineCounts])
-
-  const handleSaveUsername = () => {
-    if (!username.trim()) return
-    localStorage.setItem('cp_username', username.trim())
-  }
-
   const handleJoinClick = (room: Room) => {
-    if (!username.trim()) {
-      setError('请先设置用户名')
-      return
-    }
     setJoinModal({ roomId: room.id, roomName: room.name })
     setJoinPassword('')
     setJoinError('')
@@ -108,14 +70,14 @@ export default function Home({ onEnterRoom, onOpenDebugLab }: HomeProps) {
     setJoining(true)
     setJoinError('')
     try {
-      await joinRoom(joinModal.roomId, {
+      await joinRoom({
         user_id: userId,
-        username: username.trim(),
+        username: username,
         password: joinPassword,
         user_type: 'human',
       })
       setJoinModal(null)
-      onEnterRoom(joinModal.roomId, userId, username.trim())
+      onEnterRoom(joinModal.roomId, joinPassword)
     } catch (e: unknown) {
       const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
       setJoinError(msg ?? '加入失败，请检查密码')
@@ -125,33 +87,77 @@ export default function Home({ onEnterRoom, onOpenDebugLab }: HomeProps) {
   }
 
   const handleCreateSubmit = async () => {
-    if (!username.trim()) {
-      setCreateError('请先设置用户名')
-      return
-    }
     setCreating(true)
     setCreateError('')
     try {
-      const room = await createRoom(
+      const result = await createRoom(
         {
           name: createForm.name,
           description: createForm.description || undefined,
-          password: createForm.password,
           max_members: createForm.max_members,
         },
         userId,
-        username.trim(),
+        username,
       )
       setCreateModal(false)
-      setRooms((prev) => [room, ...prev])
-      // 创建者自动加入
-      onEnterRoom(room.id, userId, username.trim())
+      setRooms((prev) => [result, ...prev])
+      // 展示一次性密码弹窗（不立即跳转，等用户确认保存密码）
+      setNewRoomSecret({
+        roomId: result.id,
+        roomName: result.name,
+        plainPassword: result.plain_password,
+      })
+      setPasswordCopied(false)
     } catch (e: unknown) {
       const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
       setCreateError(msg ?? '创建失败')
     } finally {
       setCreating(false)
     }
+  }
+
+  const handleCopyRoomId = async () => {
+    if (!newRoomSecret) return
+    try {
+      await navigator.clipboard.writeText(newRoomSecret.roomId)
+      setRoomIdCopied(true)
+      setTimeout(() => setRoomIdCopied(false), 2000)
+    } catch {
+      const el = document.createElement('textarea')
+      el.value = newRoomSecret.roomId
+      document.body.appendChild(el)
+      el.select()
+      document.execCommand('copy')
+      document.body.removeChild(el)
+      setRoomIdCopied(true)
+      setTimeout(() => setRoomIdCopied(false), 2000)
+    }
+  }
+
+  const handleCopyPassword = async () => {
+    if (!newRoomSecret) return
+    try {
+      await navigator.clipboard.writeText(newRoomSecret.plainPassword)
+      setPasswordCopied(true)
+      setTimeout(() => setPasswordCopied(false), 2000)
+    } catch {
+      // 降级方案
+      const el = document.createElement('textarea')
+      el.value = newRoomSecret.plainPassword
+      document.body.appendChild(el)
+      el.select()
+      document.execCommand('copy')
+      document.body.removeChild(el)
+      setPasswordCopied(true)
+      setTimeout(() => setPasswordCopied(false), 2000)
+    }
+  }
+
+  const handleEnterNewRoom = () => {
+    if (!newRoomSecret) return
+    const { roomId, plainPassword } = newRoomSecret
+    setNewRoomSecret(null)
+    onEnterRoom(roomId, plainPassword)
   }
 
   const filteredRooms = rooms.filter(
@@ -175,16 +181,18 @@ export default function Home({ onEnterRoom, onOpenDebugLab }: HomeProps) {
             </div>
           </div>
 
-          {/* 用户名设置 */}
-          <div className="flex items-center gap-2">
-            <input
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              onBlur={handleSaveUsername}
-              placeholder="输入你的用户名"
-              className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-1.5 text-sm placeholder-gray-500 focus:border-indigo-500 focus:outline-none"
-            />
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 rounded-lg border border-gray-700 bg-gray-800 px-3 py-1.5">
+              <div className="h-2 w-2 rounded-full bg-green-400" />
+              <span className="text-sm text-gray-200">{username}</span>
+              <span className="text-xs text-gray-500">{userId}</span>
+            </div>
+            <button
+              onClick={onLogout}
+              className="rounded-lg border border-gray-700 px-3 py-1.5 text-sm text-gray-400 hover:border-red-700 hover:text-red-400 transition-colors"
+            >
+              退出
+            </button>
           </div>
         </div>
       </header>
@@ -207,10 +215,6 @@ export default function Home({ onEnterRoom, onOpenDebugLab }: HomeProps) {
             </button>
             <button
               onClick={() => {
-                if (!username.trim()) {
-                  setError('请先设置用户名')
-                  return
-                }
                 setCreateModal(true)
                 setCreateError('')
               }}
@@ -280,11 +284,7 @@ export default function Home({ onEnterRoom, onOpenDebugLab }: HomeProps) {
                   <p className="mb-3 text-sm text-gray-400 line-clamp-2">{room.description}</p>
                 )}
                 <div className="mt-auto flex items-center justify-between text-xs text-gray-500">
-                  <span>
-                    {roomOnlineCounts[room.id]
-                      ? `${roomOnlineCounts[room.id].humans} 人 / ${roomOnlineCounts[room.id].agents} 智能体`
-                      : `${room.member_count} / ${room.max_members} 人`}
-                  </span>
+                  <span>{room.member_count} / {room.max_members} 人</span>
                 </div>
                 <button
                   onClick={() => handleJoinClick(room)}
@@ -352,13 +352,6 @@ export default function Home({ onEnterRoom, onOpenDebugLab }: HomeProps) {
                 placeholder="描述（可选）"
                 className="w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none"
               />
-              <input
-                type="password"
-                value={createForm.password}
-                onChange={(e) => setCreateForm((f) => ({ ...f, password: e.target.value }))}
-                placeholder="房间密码（至少4位）"
-                className="w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none"
-              />
               <div className="flex items-center gap-2">
                 <label className="text-sm text-gray-400">最大成员数</label>
                 <input
@@ -373,6 +366,9 @@ export default function Home({ onEnterRoom, onOpenDebugLab }: HomeProps) {
                 />
               </div>
             </div>
+            <p className="mt-3 text-xs text-gray-500">
+              密码将由服务端自动生成，创建成功后一次性显示，请妥善保存。
+            </p>
             {createError && <p className="mt-2 text-sm text-red-400">{createError}</p>}
             <div className="mt-4 flex gap-2">
               <button
@@ -383,10 +379,66 @@ export default function Home({ onEnterRoom, onOpenDebugLab }: HomeProps) {
               </button>
               <button
                 onClick={handleCreateSubmit}
-                disabled={creating || !createForm.name || !createForm.password}
+                disabled={creating || !createForm.name}
                 className="flex-1 rounded-lg bg-indigo-600 py-2 text-sm font-medium hover:bg-indigo-700 disabled:opacity-50"
               >
                 {creating ? '创建中...' : '创建'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 一次性密码展示弹窗 */}
+      {newRoomSecret && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70">
+          <div className="w-full max-w-md rounded-xl border border-yellow-700/60 bg-gray-900 p-6">
+            <div className="mb-1 flex items-center gap-2 text-yellow-400">
+              <svg className="h-5 w-5 flex-shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
+              </svg>
+              <h3 className="text-lg font-semibold">请保存房间密码</h3>
+            </div>
+            <p className="mb-4 text-sm text-gray-400">
+              房间 <span className="font-medium text-gray-200">{newRoomSecret.roomName}</span> 已创建成功。
+              以下房间 ID 与密码<span className="text-yellow-400 font-medium">仅显示一次</span>，
+              分享给需要加入的成员后请妥善保存。
+            </p>
+            <div className="mb-2 flex items-center gap-2 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2">
+              <span className="flex-shrink-0 text-xs text-gray-400">房间 ID</span>
+              <code className="flex-1 break-all font-mono text-sm text-blue-300 select-all">
+                {newRoomSecret.roomId}
+              </code>
+              <button
+                onClick={handleCopyRoomId}
+                className="flex-shrink-0 rounded-md border border-gray-600 px-3 py-1.5 text-xs hover:bg-gray-700 transition-colors"
+              >
+                {roomIdCopied ? '已复制' : '复制'}
+              </button>
+            </div>
+            <div className="mb-4 flex items-center gap-2 rounded-lg border border-gray-700 bg-gray-800 px-3 py-3">
+              <code className="flex-1 break-all font-mono text-sm text-green-400 select-all">
+                {newRoomSecret.plainPassword}
+              </code>
+              <button
+                onClick={handleCopyPassword}
+                className="flex-shrink-0 rounded-md border border-gray-600 px-3 py-1.5 text-xs hover:bg-gray-700 transition-colors"
+              >
+                {passwordCopied ? '已复制' : '复制'}
+              </button>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setNewRoomSecret(null)}
+                className="flex-1 rounded-lg border border-gray-700 py-2 text-sm hover:bg-gray-800"
+              >
+                稍后进入
+              </button>
+              <button
+                onClick={handleEnterNewRoom}
+                className="flex-1 rounded-lg bg-indigo-600 py-2 text-sm font-medium hover:bg-indigo-700"
+              >
+                进入房间
               </button>
             </div>
           </div>

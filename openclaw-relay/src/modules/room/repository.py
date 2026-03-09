@@ -39,6 +39,7 @@ class Room:
         name: str,
         password_hash: str,
         created_by: str,
+        access_token: str = "",
         description: Optional[str] = None,
         max_members: int = 50,
         message_retention: int = 0,
@@ -50,6 +51,7 @@ class Room:
         self.name = name
         self.description = description
         self.password_hash = password_hash
+        self.access_token = access_token
         self.max_members = max_members
         self.message_retention = message_retention
         self.allow_anonymous = allow_anonymous

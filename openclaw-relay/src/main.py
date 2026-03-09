@@ -12,6 +12,7 @@ from .modules.websocket.manager import WebSocketManager
 from .modules.agent.registry import AgentRegistry
 from .modules.room.router import router as room_router, setup_room_router
 from .modules.agent.router import router as agent_router, setup_agent_router
+from .modules.auth.router import router as auth_router
 from .modules.mcp.server import setup_mcp_server, setup_message_service
 from .schemas.message import MessageCreate, MessageFilter
 
@@ -102,6 +103,7 @@ app.add_middleware(
 app.mount("/mcp", mcp_server.sse_app())
 
 # 注册路由
+app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(room_router, prefix="/api/v1/rooms", tags=["rooms"])
 app.include_router(agent_router, prefix="/api/v1/agents", tags=["agents"])
 
@@ -116,7 +118,7 @@ async def root():
         "endpoints": {
             "rooms": "/api/v1/rooms",
             "agents": "/api/v1/agents",
-            "websocket": "/ws/{room_id}",
+            "websocket": "/ws?password=<access_token>",
             "mcp": "/mcp",
             "docs": "/docs",
             "redoc": "/redoc",
@@ -134,24 +136,44 @@ async def health_check():
     }
 
 
-@app.websocket("/ws/{room_id}")
+@app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
-    room_id: str,
-    user_id: str = Query(...),
-    username: str = Query(...),
+    password: str = Query(""),
+    user_id: str = Query(""),
+    username: str = Query(""),
     user_type: str = Query("human"),
     role: str = Query("member"),
+    token: str = Query(""),
 ):
-    """WebSocket 端点"""
-    from uuid import UUID
+    """WebSocket 端点 — 通过 password（access_token）定位房间"""
+    from .core.security import decode_token as _decode_token
 
+    room_uuid = None
     try:
-        try:
-            room_uuid = UUID(room_id)
-        except ValueError:
-            await websocket.close(code=4000, reason="Invalid room ID")
+        # 通过密码查找房间
+        if not password:
+            await websocket.close(code=4000, reason="Room password required")
             return
+
+        room = await room_service.get_room_by_password(password)
+        if not room:
+            await websocket.close(code=4004, reason="Room not found or invalid password")
+            return
+        room_uuid = room.id
+
+        # 人类用户必须携带有效 JWT token
+        if user_type == "human":
+            if not token:
+                await websocket.close(code=4001, reason="Authentication required")
+                return
+            try:
+                payload = _decode_token(token)
+                user_id = payload["sub"]
+                username = payload["username"]
+            except Exception:
+                await websocket.close(code=4001, reason="Invalid token")
+                return
 
         connected = await ws_manager.connect(
             websocket=websocket,
@@ -172,38 +194,39 @@ async def websocket_endpoint(
                 if response:
                     await websocket.send_json(response)
             except WebSocketDisconnect:
-                logger.info("websocket_disconnected", room_id=room_id, user_id=user_id)
+                logger.info("websocket_disconnected", room_id=str(room_uuid), user_id=user_id)
                 break
             except json.JSONDecodeError:
-                logger.warning("invalid_json", room_id=room_id, user_id=user_id)
+                logger.warning("invalid_json", room_id=str(room_uuid), user_id=user_id)
                 await websocket.send_json({"error": "Invalid JSON"})
             except Exception as e:
-                logger.error("websocket_error", room_id=room_id, user_id=user_id, error=str(e))
+                logger.error("websocket_error", room_id=str(room_uuid), user_id=user_id, error=str(e))
                 await websocket.send_json({"error": "Internal server error"})
 
     except Exception as e:
         logger.error("websocket_endpoint_error", error=str(e))
     finally:
-        try:
-            room_uuid = UUID(room_id)
-            await ws_manager.disconnect(room_uuid, user_id)
-        except Exception as e:
-            logger.error("disconnect_error", error=str(e))
+        if room_uuid is not None:
+            try:
+                await ws_manager.disconnect(room_uuid, user_id)
+            except Exception as e:
+                logger.error("disconnect_error", error=str(e))
 
 
-@app.post("/api/v1/rooms/{room_id}/messages", status_code=201)
-async def create_message_endpoint(room_id: str, body: dict):
-    """通过 HTTP 发送消息（非 WebSocket 场景使用）"""
-    from uuid import UUID
+@app.post("/api/v1/rooms/messages", status_code=201)
+async def create_message_endpoint(body: dict):
+    """通过 HTTP 发送消息 — body 需包含 password（access_token）"""
+    password = body.get("password", "")
+    if not password:
+        raise HTTPException(status_code=400, detail="Room password required")
 
-    try:
-        room_uuid = UUID(room_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid room ID")
+    room = await room_service.get_room_by_password(password)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found or invalid password")
 
     try:
         data = MessageCreate(
-            room_id=room_uuid,
+            room_id=room.id,
             sender_id=body.get("sender_id", ""),
             sender_name=body.get("sender_name", ""),
             text=body.get("text", ""),
@@ -216,7 +239,7 @@ async def create_message_endpoint(room_id: str, body: dict):
 
         # 广播给所有 WebSocket 连接
         await ws_manager.broadcast_to_room(
-            room_uuid,
+            room.id,
             {"event": "message", "data": message.to_dict()},
         )
 
@@ -228,24 +251,21 @@ async def create_message_endpoint(room_id: str, body: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/v1/rooms/{room_id}/messages")
+@app.get("/api/v1/rooms/messages")
 async def get_messages_endpoint(
-    room_id: str,
+    password: str = Query(..., description="房间 access_token"),
     limit: int = Query(default=20, ge=1, le=100),
     start_message_id: int = Query(default=None),
 ):
-    """获取房间消息历史"""
-    from uuid import UUID
-
-    try:
-        room_uuid = UUID(room_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid room ID")
+    """获取房间消息历史 — 通过 password（access_token）定位房间"""
+    room = await room_service.get_room_by_password(password)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found or invalid password")
 
     try:
         messages = await message_service.get_messages(
             MessageFilter(
-                room_id=room_uuid,
+                room_id=room.id,
                 limit=limit,
                 start_message_id=start_message_id,
             )
@@ -253,7 +273,7 @@ async def get_messages_endpoint(
         return {
             "messages": [msg.to_dict() for msg in messages],
             "total": len(messages),
-            "room_id": room_id,
+            "room_id": str(room.id),
         }
     except Exception as e:
         logger.error("get_messages_http_error", error=str(e))

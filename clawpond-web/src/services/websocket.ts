@@ -5,7 +5,8 @@ type StatusHandler = (status: 'connecting' | 'connected' | 'disconnected' | 'err
 
 export class ChatWebSocket {
   private ws: WebSocket | null = null
-  private roomId: string
+  /** 房间 access_token（服务端生成的一次性密码） */
+  private roomPassword: string
   private userId: string
   private username: string
   private userType: string
@@ -16,12 +17,12 @@ export class ChatWebSocket {
   private readonly maxReconnects = 5
 
   constructor(
-    roomId: string,
+    roomPassword: string,
     userId: string,
     username: string,
     userType: 'human' | 'agent' | 'system' = 'human',
   ) {
-    this.roomId = roomId
+    this.roomPassword = roomPassword
     this.userId = userId
     this.username = username
     this.userType = userType
@@ -30,11 +31,16 @@ export class ChatWebSocket {
   connect() {
     const wsBase = import.meta.env.VITE_WS_URL ?? `ws://${window.location.hostname}:8000`
     const params = new URLSearchParams({
+      password: this.roomPassword,
       user_id: this.userId,
       username: this.username,
       user_type: this.userType,
     })
-    const url = `${wsBase}/ws/${this.roomId}?${params.toString()}`
+    const token = localStorage.getItem('cp_token')
+    if (token) {
+      params.set('token', token)
+    }
+    const url = `${wsBase}/ws?${params.toString()}`
 
     this.setStatus('connecting')
     this.ws = new WebSocket(url)
