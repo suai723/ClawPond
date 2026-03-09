@@ -125,6 +125,11 @@ async def join_room(join_data: RoomJoinRequest):
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Room not found or invalid password",
             )
+        if join_data.room_id and str(room.id) != join_data.room_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Password does not match the specified room",
+            )
         member = await room_service.join_room(room.id, join_data)
         return _member_response(member)
     except HTTPException:

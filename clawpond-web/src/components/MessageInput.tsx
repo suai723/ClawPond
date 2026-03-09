@@ -7,10 +7,17 @@ interface MentionCandidate {
   agentId?: string
 }
 
+interface HumanMemberCandidate {
+  username: string
+  userId: string
+}
+
 interface MessageInputProps {
   onSend: (text: string, mentions: MentionTarget[], replyTo?: number) => void
   /** agent 成员列表（含 agentId） */
   agentMembers: MentionCandidate[]
+  /** 人类成员列表（含 userId） */
+  humanMembers?: HumanMemberCandidate[]
   /** 所有成员用户名（人类 + agent，用于补全） */
   memberNames: string[]
   disabled?: boolean
@@ -21,6 +28,7 @@ interface MessageInputProps {
 export default function MessageInput({
   onSend,
   agentMembers,
+  humanMembers = [],
   memberNames,
   disabled = false,
   replyTo,
@@ -59,17 +67,24 @@ export default function MessageInput({
       if (seen.has(username)) continue
       seen.add(username)
 
-      // 优先用选框确认的（含 agentId）
+      // 优先用选框确认的（含 agentId 或 userId）
       const confirmed = confirmedMentionsRef.current.get(username)
       if (confirmed) {
         result.push(confirmed)
         continue
       }
 
-      // 后备：在 agentMembers 里找（处理手动输入的情况）
+      // 后备：在 agentMembers 里找 agent 成员
       const agentMember = agentMembers.find((a) => a.username.toLowerCase() === username.toLowerCase())
       if (agentMember && agentMember.agentId) {
         result.push({ agentId: agentMember.agentId, username: agentMember.username })
+        continue
+      }
+
+      // 后备：在 humanMembers 里找人类成员
+      const humanMember = humanMembers.find((h) => h.username.toLowerCase() === username.toLowerCase())
+      if (humanMember) {
+        result.push({ userId: humanMember.userId, username: humanMember.username })
       }
     }
 
@@ -119,12 +134,23 @@ export default function MessageInput({
       setText(newText)
       setSuggestion(null)
 
-      // 记录选框确认的 mention（含 agentId）
+      // 记录选框确认的 mention（agent 含 agentId，人类含 userId）
       if (candidate.agentId) {
         confirmedMentionsRef.current.set(candidate.username, {
           agentId: candidate.agentId,
           username: candidate.username,
         })
+      } else {
+        // 人类成员：从 humanMembers 中查出 userId
+        const humanMember = humanMembers.find(
+          (h) => h.username.toLowerCase() === candidate.username.toLowerCase(),
+        )
+        if (humanMember) {
+          confirmedMentionsRef.current.set(candidate.username, {
+            userId: humanMember.userId,
+            username: humanMember.username,
+          })
+        }
       }
 
       textareaRef.current.focus()

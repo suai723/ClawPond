@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { ChatWebSocket } from '../services/websocket'
 import { getMessages, getRoom } from '../services/api'
+import { useWebSocket } from '../contexts/WebSocketContext'
 import type { Message, MentionTarget, Room, OnlineMember, WSEvent } from '../types'
 import MessageList from '../components/MessageList'
 import MessageInput from '../components/MessageInput'
@@ -8,7 +8,7 @@ import MemberSidebar from '../components/MemberSidebar'
 
 interface ChatRoomProps {
   roomId: string
-  /** 房间 access_token，用于 WS 连接和消息操作 */
+  /** 房间 access_token，用于 joinRoom 订阅 */
   roomPassword: string
   userId: string
   username: string
@@ -24,43 +24,57 @@ export default function ChatRoom({ roomId, roomPassword, userId, username, onLea
   const [status, setStatus] = useState<ConnectionStatus>('connecting')
   const [sidebarOpen, setSidebarOpen] = useState(true)
 
-  const wsRef = useRef<ChatWebSocket | null>(null)
+  const ws = useWebSocket()
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [])
 
-  // 加载房间信息（仍使用 room_id，此为公开端点）
+  // 加载房间信息
   useEffect(() => {
     getRoom(roomId).catch(console.error).then((r) => r && setRoom(r))
   }, [roomId])
 
-  // 加载历史消息（使用 roomPassword 作为 access_token）
+  // 加载历史消息
   useEffect(() => {
-    getMessages(roomPassword, 50).then((data) => {
-      setMessages(data.messages)
-    }).catch(console.error)
+    getMessages(roomPassword, 50)
+      .then((data) => setMessages(data.messages))
+      .catch(console.error)
   }, [roomPassword])
 
-  // WebSocket 连接（使用 roomPassword 定位房间）
+  // 加入房间 + 订阅消息事件
   useEffect(() => {
-    const ws = new ChatWebSocket(roomPassword, userId, username, 'human')
-    wsRef.current = ws
+    if (!ws) return
 
-    const unsubStatus = ws.onStatus(setStatus)
+    // 用局部变量标记此次 effect 是否已被 cleanup，避免异步 await 后更新已卸载组件的状态
+    let cancelled = false
 
+    const doJoin = async () => {
+      setStatus('connecting')
+      try {
+        const roomData = await ws.joinRoom(roomPassword)
+        if (cancelled) return
+        setOnlineMembers(roomData.online_members)
+        setStatus('connected')
+      } catch (err) {
+        if (cancelled) return
+        console.error('[ChatRoom] joinRoom failed', err)
+        setStatus('error')
+      }
+    }
+
+    // 订阅房间事件，仅处理属于本房间的消息
     const unsubEvent = ws.onEvent((event: WSEvent) => {
-      if (event.event === 'connected') {
-        setOnlineMembers(event.data.online_members)
-      } else if (event.event === 'message' || event.event === 'systemMessage') {
+      if (event.event === 'message' || event.event === 'systemMessage') {
+        if (event.data.room_id !== roomId) return
         setMessages((prev) => {
-          // 防止重复
           if (prev.some((m) => m.id === event.data.id)) return prev
           return [...prev, event.data]
         })
         scrollToBottom()
       } else if (event.event === 'memberJoined') {
+        if (event.data.room_id !== roomId) return
         setOnlineMembers((prev) => {
           if (prev.some((m) => m.user_id === event.data.user_id)) return prev
           return [
@@ -78,32 +92,53 @@ export default function ChatRoom({ roomId, roomPassword, userId, username, onLea
           ]
         })
       } else if (event.event === 'memberLeft') {
+        if (event.data.room_id !== roomId) return
         setOnlineMembers((prev) => prev.filter((m) => m.user_id !== event.data.user_id))
+      } else if (event.event === 'connected') {
+        // WS 断线重连后 server 会重新推送 connected，此时显示正在重新加入
+        setStatus('connecting')
       }
     })
 
-    ws.connect()
+    // WS 已连接则立即加入，否则等 connected 事件后加入
+    if (ws.isConnected) {
+      doJoin()
+    } else {
+      const unsubReconnect = ws.onStatus((s) => {
+        if (s === 'connected') {
+          unsubReconnect()
+          if (!cancelled) doJoin()
+        } else if (s === 'error' || s === 'disconnected') {
+          if (!cancelled) setStatus(s)
+        }
+      })
+    }
 
     return () => {
-      unsubStatus()
+      cancelled = true
       unsubEvent()
-      ws.disconnect()
-      wsRef.current = null
+      ws.leaveRoom(roomId)
     }
-  }, [roomPassword, userId, username, scrollToBottom])
+  }, [ws, roomPassword, roomId, scrollToBottom])
 
   useEffect(() => {
     scrollToBottom()
   }, [messages, scrollToBottom])
 
-  const handleSend = useCallback((text: string, mentions: MentionTarget[], replyTo?: number) => {
-    wsRef.current?.sendMessage(text, mentions, replyTo)
-  }, [])
+  const handleSend = useCallback(
+    (text: string, mentions: MentionTarget[], replyTo?: number) => {
+      ws?.sendMessage(roomId, text, mentions, replyTo)
+    },
+    [ws, roomId],
+  )
 
-  // 构建 agentMembers 列表，包含 agentId（供 @mention 选框使用）
   const agentMembers = onlineMembers
     .filter((m) => m.user_type === 'agent')
     .map((m) => ({ username: m.username, agentId: m.agent_id }))
+
+  const humanMembers = onlineMembers
+    .filter((m) => m.user_type === 'human')
+    .map((m) => ({ username: m.username, userId: m.user_id }))
 
   const statusColors: Record<ConnectionStatus, string> = {
     connecting: 'bg-yellow-400',
@@ -166,6 +201,7 @@ export default function ChatRoom({ roomId, roomPassword, userId, username, onLea
           <MessageInput
             onSend={handleSend}
             agentMembers={agentMembers}
+            humanMembers={humanMembers}
             memberNames={onlineMembers.map((m) => m.username)}
             disabled={status !== 'connected'}
           />

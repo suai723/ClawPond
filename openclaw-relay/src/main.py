@@ -30,42 +30,19 @@ async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     logger.info("openclaw_relay_starting")
 
-    # 初始化数据库连接
     await init_db()
     logger.info("database_connected")
 
-    # 将共享实例注入到各路由模块
     setup_room_router(room_service)
-    # 注入 agent_registry 到 message_service
     message_service.set_agent_registry(agent_registry)
-
-    # 注入广播回调（让 MessageService 能广播 Agent 回复）
     message_service.set_broadcast_callback(ws_manager.broadcast_to_room)
-
-    # 注入 WS 连接检查：若 Agent 已通过 WebSocket 在线，跳过 HTTP A2A 调用
     message_service.set_ws_connected_check(ws_manager.is_connected)
-
-    # 注入依赖到 agent router
     setup_agent_router(agent_registry, room_service)
 
-    # 从数据库恢复 Agent 注册（防止 relay 重启后 AgentRegistry 清空）
+    # 从 agents 表恢复内存缓存（含 secret_hash，可直接校验 WS 凭据）
     try:
-        agent_members = await room_service.get_all_agent_members()
-        restored_count = 0
-        for member in agent_members:
-            try:
-                # 使用 DB 中存储的 agent_id，保持 ID 稳定；若旧数据无 agent_id 则生成新的
-                await agent_registry.register_agent(
-                    name=member.username,
-                    endpoint=member.a2a_endpoint or "ws-only",
-                    room_id=member.room_id,
-                    agent_id=member.agent_id or None,  # None → registry 会生成新 UUID
-                )
-                restored_count += 1
-            except Exception:
-                pass  # 防御性：跳过恢复失败的 agent
-        if restored_count:
-            logger.info("agents_restored_from_db", count=restored_count)
+        restored = await agent_registry.restore_from_db()
+        logger.info("agent_registry_restored", count=restored)
     except Exception as e:
         logger.warning("agent_restore_failed", error=str(e))
 
@@ -82,7 +59,6 @@ async def lifespan(app: FastAPI):
 mcp_server = setup_mcp_server(room_service, agent_registry)
 setup_message_service(message_service)
 
-# 创建 FastAPI 应用
 app = FastAPI(
     title="OpenClaw Multi-Agent Relay Service",
     version="0.1.0",
@@ -90,7 +66,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# 配置 CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -99,10 +74,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 挂载 MCP Server（SSE 端点）
 app.mount("/mcp", mcp_server.sse_app())
 
-# 注册路由
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(room_router, prefix="/api/v1/rooms", tags=["rooms"])
 app.include_router(agent_router, prefix="/api/v1/agents", tags=["agents"])
@@ -110,7 +83,6 @@ app.include_router(agent_router, prefix="/api/v1/agents", tags=["agents"])
 
 @app.get("/")
 async def root():
-    """根路由"""
     return {
         "name": "OpenClaw Relay Service",
         "version": "0.1.0",
@@ -118,7 +90,8 @@ async def root():
         "endpoints": {
             "rooms": "/api/v1/rooms",
             "agents": "/api/v1/agents",
-            "websocket": "/ws?password=<access_token>",
+            "websocket_human": "/ws?token=<jwt>",
+            "websocket_agent": "/ws?agent_id=<id>&agent_secret=<secret>&user_type=agent",
             "mcp": "/mcp",
             "docs": "/docs",
             "redoc": "/redoc",
@@ -128,7 +101,6 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """健康检查"""
     return {
         "status": "healthy",
         "service": "openclaw-relay",
@@ -139,49 +111,64 @@ async def health_check():
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
-    password: str = Query(""),
+    # 人类用户
+    token: str = Query(""),
+    # Agent 用户（新认证方式：agent_id + agent_secret）
+    agent_id: str = Query(""),
+    agent_secret: str = Query(""),
+    # 通用参数
+    user_type: str = Query("human"),
+    # 旧式非认证参数（保留向后兼容，仅 user_type 非 human/agent 时使用）
     user_id: str = Query(""),
     username: str = Query(""),
-    user_type: str = Query("human"),
-    role: str = Query("member"),
-    token: str = Query(""),
 ):
-    """WebSocket 端点 — 通过 password（access_token）定位房间"""
+    """WebSocket 端点
+
+    - 人类用户：/ws?token=<jwt>
+    - Agent 用户：/ws?agent_id=<id>&agent_secret=<secret>&user_type=agent
+    """
     from .core.security import decode_token as _decode_token
 
-    room_uuid = None
+    resolved_user_id = ""
+    resolved_username = ""
+
     try:
-        # 通过密码查找房间
-        if not password:
-            await websocket.close(code=4000, reason="Room password required")
-            return
-
-        room = await room_service.get_room_by_password(password)
-        if not room:
-            await websocket.close(code=4004, reason="Room not found or invalid password")
-            return
-        room_uuid = room.id
-
-        # 人类用户必须携带有效 JWT token
         if user_type == "human":
             if not token:
                 await websocket.close(code=4001, reason="Authentication required")
                 return
             try:
                 payload = _decode_token(token)
-                user_id = payload["sub"]
-                username = payload["username"]
+                resolved_user_id = payload["sub"]
+                resolved_username = payload["username"]
             except Exception:
                 await websocket.close(code=4001, reason="Invalid token")
                 return
 
+        elif user_type == "agent":
+            if not agent_id or not agent_secret:
+                await websocket.close(code=4000, reason="agent_id and agent_secret required")
+                return
+            agent_info = await agent_registry.verify_agent(agent_id, agent_secret)
+            if not agent_info:
+                await websocket.close(code=4001, reason="Invalid agent credentials")
+                return
+            resolved_user_id = f"agent-{agent_id}"
+            resolved_username = agent_info.name
+
+        else:
+            # 向后兼容：system 等类型，要求明确传 user_id 和 username
+            if not user_id or not username:
+                await websocket.close(code=4000, reason="user_id and username required")
+                return
+            resolved_user_id = user_id
+            resolved_username = username
+
         connected = await ws_manager.connect(
             websocket=websocket,
-            room_id=room_uuid,
-            user_id=user_id,
-            username=username,
+            user_id=resolved_user_id,
+            username=resolved_username,
             user_type=user_type,
-            role=role,
         )
 
         if not connected:
@@ -190,27 +177,27 @@ async def websocket_endpoint(
         while True:
             try:
                 data = await websocket.receive_json()
-                response = await ws_manager.handle_message(room_uuid, user_id, data)
+                response = await ws_manager.handle_message(resolved_user_id, data)
                 if response:
                     await websocket.send_json(response)
             except WebSocketDisconnect:
-                logger.info("websocket_disconnected", room_id=str(room_uuid), user_id=user_id)
+                logger.info("websocket_disconnected", user_id=resolved_user_id)
                 break
             except json.JSONDecodeError:
-                logger.warning("invalid_json", room_id=str(room_uuid), user_id=user_id)
+                logger.warning("invalid_json", user_id=resolved_user_id)
                 await websocket.send_json({"error": "Invalid JSON"})
             except Exception as e:
-                logger.error("websocket_error", room_id=str(room_uuid), user_id=user_id, error=str(e))
+                logger.error("websocket_error", user_id=resolved_user_id, error=str(e))
                 await websocket.send_json({"error": "Internal server error"})
 
     except Exception as e:
         logger.error("websocket_endpoint_error", error=str(e))
     finally:
-        if room_uuid is not None:
-            try:
-                await ws_manager.disconnect(room_uuid, user_id)
-            except Exception as e:
-                logger.error("disconnect_error", error=str(e))
+        try:
+            if resolved_user_id:
+                await ws_manager.disconnect(resolved_user_id)
+        except Exception as e:
+            logger.error("disconnect_error", error=str(e))
 
 
 @app.post("/api/v1/rooms/messages", status_code=201)
@@ -237,7 +224,6 @@ async def create_message_endpoint(body: dict):
         )
         message = await message_service.send_message(data)
 
-        # 广播给所有 WebSocket 连接
         await ws_manager.broadcast_to_room(
             room.id,
             {"event": "message", "data": message.to_dict()},

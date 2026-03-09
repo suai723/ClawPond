@@ -1,35 +1,41 @@
 import { useState, useCallback, useRef } from 'react'
 import { ChatWebSocket } from '../services/websocket'
-import { joinRoom as apiJoinRoom, leaveRoom as apiLeaveRoom } from '../services/api'
+import {
+  registerAgent as apiRegisterAgent,
+  agentJoinRoom as apiAgentJoinRoom,
+  joinRoom as apiJoinRoom,
+  leaveRoom as apiLeaveRoom,
+} from '../services/api'
 import type { Message, WSEvent, OnlineMember, MentionTarget } from '../types'
 
-// 颜色色板，循环分配给各模拟用户
 const AGENT_COLORS = [
-  '#22c55e', // green
-  '#3b82f6', // blue
-  '#f59e0b', // amber
-  '#ef4444', // red
-  '#a855f7', // purple
-  '#06b6d4', // cyan
-  '#ec4899', // pink
-  '#f97316', // orange
+  '#22c55e',
+  '#3b82f6',
+  '#f59e0b',
+  '#ef4444',
+  '#a855f7',
+  '#06b6d4',
+  '#ec4899',
+  '#f97316',
 ]
 
 export type AgentStatus = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error'
 
 export interface SimulatedAgent {
   localId: string
+  /** WS 连接所用 user_id（agent 为 agent-{agentId}，human 为 sim-xxx） */
   userId: string
   username: string
   userType: 'human' | 'agent'
   color: string
-  /** 仅用于 UI 展示（房间名查找） */
   roomId: string | null
-  /** 用于 WS 连接和离开操作的 access_token */
   roomPassword: string | null
   status: AgentStatus
   inputText: string
-  agentId?: string  // 加入房间后由后端分配
+  /** 服务端分配的 agent UUID（仅 agent 类型有值，注册后持久化） */
+  agentId?: string
+  /** 注册时返回的 secret，仅内存保存，用于 WS 认证 */
+  agentSecret?: string
 }
 
 export interface FeedMessage extends Message {
@@ -70,9 +76,7 @@ export function useSimulatedAgents() {
   const [feed, setFeed] = useState<FeedItem[]>([])
   const [onlineMembers, setOnlineMembers] = useState<OnlineMember[]>([])
 
-  // 保存 WS 客户端引用，不放进 state 以避免不必要的重渲染
   const wsClientsRef = useRef<Map<string, ChatWebSocket>>(new Map())
-  // 已知消息 id，用于去重
   const knownMessageIds = useRef<Set<string>>(new Set())
 
   const pushMessage = useCallback((msg: Message, agentColor: string, agentLocalId: string) => {
@@ -103,6 +107,20 @@ export function useSimulatedAgents() {
               ...(roomId !== undefined ? { roomId } : {}),
               ...(roomPassword !== undefined ? { roomPassword } : {}),
             }
+          : a,
+      ),
+    )
+  }, [])
+
+  const updateAgentCredentials = useCallback((
+    localId: string,
+    agentId: string,
+    agentSecret: string,
+  ) => {
+    setAgents((prev) =>
+      prev.map((a) =>
+        a.localId === localId
+          ? { ...a, agentId, agentSecret, userId: `agent-${agentId}` }
           : a,
       ),
     )
@@ -143,120 +161,286 @@ export function useSimulatedAgents() {
     const agent = agents.find((a) => a.localId === localId)
     if (!agent) return
 
-    // 先断开旧连接（如有）
-    const oldWs = wsClientsRef.current.get(localId)
-    if (oldWs) {
-      oldWs.disconnect()
-      wsClientsRef.current.delete(localId)
-    }
-
     updateAgentStatus(localId, 'connecting', roomId, password)
 
-    try {
-      await apiJoinRoom({
-        user_id: agent.userId,
-        username: agent.username,
-        password,
-        user_type: agent.userType,
-      })
-    } catch (err) {
-      console.error(`[DebugLab] ${agent.username} 加入房间失败`, err)
-      updateAgentStatus(localId, 'error')
-      pushEvent({
-        id: crypto.randomUUID(),
-        type: 'error',
-        text: `${agent.username} 加入房间失败: ${(err as Error).message ?? '未知错误'}`,
-        timestamp: new Date().toISOString(),
-        agentColor: agent.color,
-      })
-      return
-    }
+    if (agent.userType === 'agent') {
+      // ── Agent 流程：register（首次）→ agentJoinRoom → WS ──────────────────
 
-    const ws = new ChatWebSocket(password, agent.userId, agent.username, agent.userType)
+      let agentId = agent.agentId
+      let agentSecret = agent.agentSecret
 
-    ws.onStatus((status) => {
-      if (status === 'connected') {
-        updateAgentStatus(localId, 'connected', roomId)
-      } else if (status === 'disconnected') {
-        updateAgentStatus(localId, 'disconnected')
-      } else if (status === 'error') {
-        updateAgentStatus(localId, 'error')
-      }
-    })
-
-    ws.onEvent((event: WSEvent) => {
-      if ('event' in event) {
-        switch (event.event) {
-          case 'connected':
-            setOnlineMembers(event.data.online_members)
-            if (event.data.agent_id) {
-              updateAgentId(localId, event.data.agent_id)
-            }
-            break
-          case 'message':
-          case 'systemMessage':
-            pushMessage(event.data, agent.color, localId)
-            break
-          case 'memberJoined':
-            setOnlineMembers((prev) => {
-              if (prev.some((m) => m.user_id === event.data.user_id)) return prev
-              return [
-                ...prev,
-                {
-                  user_id: event.data.user_id,
-                  username: event.data.username,
-                  user_type: event.data.user_type,
-                  role: event.data.role ?? 'member',
-                  connected_at: new Date().toISOString(),
-                  last_active_at: new Date().toISOString(),
-                  message_count: 0,
-                  agent_id: event.data.agent_id,
-                },
-              ]
-            })
-            pushEvent({
-              id: crypto.randomUUID(),
-              type: 'memberJoined',
-              text: `${event.data.username} 加入了房间`,
-              timestamp: new Date().toISOString(),
-              agentColor: agent.color,
-            })
-            break
-          case 'memberLeft':
-            setOnlineMembers((prev) => prev.filter((m) => m.user_id !== event.data.user_id))
-            pushEvent({
-              id: crypto.randomUUID(),
-              type: 'memberLeft',
-              text: `${event.data.username} 离开了房间`,
-              timestamp: new Date().toISOString(),
-              agentColor: agent.color,
-            })
-            break
-          case 'error':
-            pushEvent({
-              id: crypto.randomUUID(),
-              type: 'error',
-              text: `错误: ${event.data.message}`,
-              timestamp: new Date().toISOString(),
-              agentColor: agent.color,
-            })
-            break
+      // 步骤 1：首次加入，先向服务端注册获取凭据
+      if (!agentId || !agentSecret) {
+        try {
+          const reg = await apiRegisterAgent({ name: agent.username })
+          agentId = reg.agent_id
+          agentSecret = reg.agent_secret
+          updateAgentCredentials(localId, agentId, agentSecret)
+        } catch (err) {
+          console.error(`[DebugLab] ${agent.username} 注册失败`, err)
+          updateAgentStatus(localId, 'error')
+          pushEvent({
+            id: crypto.randomUUID(),
+            type: 'error',
+            text: `${agent.username} 注册失败: ${(err as Error).message ?? '未知错误'}`,
+            timestamp: new Date().toISOString(),
+            agentColor: agent.color,
+          })
+          return
         }
       }
-    })
 
-    ws.connect()
-    wsClientsRef.current.set(localId, ws)
-  }, [agents, updateAgentStatus, updateAgentId, pushMessage, pushEvent])
+      // 步骤 2：调用 /agents/join 加入房间（写入 DB room_members）
+      try {
+        await apiAgentJoinRoom({
+          agent_id: agentId,
+          agent_secret: agentSecret,
+          room_id: roomId,
+          room_password: password,
+        })
+      } catch (err) {
+        console.error(`[DebugLab] ${agent.username} 加入房间失败`, err)
+        updateAgentStatus(localId, 'error')
+        pushEvent({
+          id: crypto.randomUUID(),
+          type: 'error',
+          text: `${agent.username} 加入房间失败: ${(err as Error).message ?? '未知错误'}`,
+          timestamp: new Date().toISOString(),
+          agentColor: agent.color,
+        })
+        return
+      }
+
+      // 步骤 3：建立 WebSocket（userId = agentId，用 agentSecret 认证）
+      let ws = wsClientsRef.current.get(localId)
+      if (!ws) {
+        ws = new ChatWebSocket(agentId, agent.username, 'agent', agentSecret)
+
+        ws.onStatus((s) => {
+          if (s === 'disconnected') updateAgentStatus(localId, 'disconnected')
+          else if (s === 'error') updateAgentStatus(localId, 'error')
+        })
+
+        ws.onEvent((event: WSEvent) => {
+          if (!('event' in event)) return
+          switch (event.event) {
+            case 'roomJoined':
+              setOnlineMembers(event.data.online_members)
+              if (event.data.agent_id) updateAgentId(localId, event.data.agent_id)
+              break
+            case 'message':
+            case 'systemMessage':
+              pushMessage(event.data, agent.color, localId)
+              break
+            case 'memberJoined':
+              setOnlineMembers((prev) => {
+                if (prev.some((m) => m.user_id === event.data.user_id)) return prev
+                return [
+                  ...prev,
+                  {
+                    user_id: event.data.user_id,
+                    username: event.data.username,
+                    user_type: event.data.user_type,
+                    role: event.data.role ?? 'member',
+                    connected_at: new Date().toISOString(),
+                    last_active_at: new Date().toISOString(),
+                    message_count: 0,
+                    agent_id: event.data.agent_id,
+                  },
+                ]
+              })
+              pushEvent({
+                id: crypto.randomUUID(),
+                type: 'memberJoined',
+                text: `${event.data.username} 加入了房间`,
+                timestamp: new Date().toISOString(),
+                agentColor: agent.color,
+              })
+              break
+            case 'memberLeft':
+              setOnlineMembers((prev) => prev.filter((m) => m.user_id !== event.data.user_id))
+              pushEvent({
+                id: crypto.randomUUID(),
+                type: 'memberLeft',
+                text: `${event.data.username} 离开了房间`,
+                timestamp: new Date().toISOString(),
+                agentColor: agent.color,
+              })
+              break
+            case 'error':
+              pushEvent({
+                id: crypto.randomUUID(),
+                type: 'error',
+                text: `错误: ${event.data.message}`,
+                timestamp: new Date().toISOString(),
+                agentColor: agent.color,
+              })
+              break
+          }
+        })
+
+        ws.connect()
+        wsClientsRef.current.set(localId, ws)
+      }
+
+      // 步骤 4：WS 订阅房间
+      const doJoin = async (wsInstance: ChatWebSocket) => {
+        try {
+          await wsInstance.joinRoom(password)
+          updateAgentStatus(localId, 'connected', roomId)
+        } catch (err) {
+          console.error(`[DebugLab] ${agent.username} joinRoom 失败`, err)
+          updateAgentStatus(localId, 'error')
+          pushEvent({
+            id: crypto.randomUUID(),
+            type: 'error',
+            text: `${agent.username} joinRoom 失败: ${(err as Error).message ?? '未知错误'}`,
+            timestamp: new Date().toISOString(),
+            agentColor: agent.color,
+          })
+        }
+      }
+
+      if (ws.isConnected) {
+        await doJoin(ws)
+      } else {
+        const unsubStatus = ws.onStatus((s) => {
+          if (s === 'connected') {
+            unsubStatus()
+            doJoin(ws!)
+          }
+        })
+      }
+
+    } else {
+      // ── Human 模拟流程（保持原有逻辑）─────────────────────────────────────
+
+      try {
+        await apiJoinRoom({
+          user_id: agent.userId,
+          username: agent.username,
+          password,
+          user_type: agent.userType,
+        })
+      } catch (err) {
+        console.error(`[DebugLab] ${agent.username} 加入房间失败`, err)
+        updateAgentStatus(localId, 'error')
+        pushEvent({
+          id: crypto.randomUUID(),
+          type: 'error',
+          text: `${agent.username} 加入房间失败: ${(err as Error).message ?? '未知错误'}`,
+          timestamp: new Date().toISOString(),
+          agentColor: agent.color,
+        })
+        return
+      }
+
+      let ws = wsClientsRef.current.get(localId)
+      if (!ws) {
+        ws = new ChatWebSocket(agent.userId, agent.username, agent.userType)
+
+        ws.onStatus((s) => {
+          if (s === 'disconnected') updateAgentStatus(localId, 'disconnected')
+          else if (s === 'error') updateAgentStatus(localId, 'error')
+        })
+
+        ws.onEvent((event: WSEvent) => {
+          if (!('event' in event)) return
+          switch (event.event) {
+            case 'roomJoined':
+              setOnlineMembers(event.data.online_members)
+              break
+            case 'message':
+            case 'systemMessage':
+              pushMessage(event.data, agent.color, localId)
+              break
+            case 'memberJoined':
+              setOnlineMembers((prev) => {
+                if (prev.some((m) => m.user_id === event.data.user_id)) return prev
+                return [
+                  ...prev,
+                  {
+                    user_id: event.data.user_id,
+                    username: event.data.username,
+                    user_type: event.data.user_type,
+                    role: event.data.role ?? 'member',
+                    connected_at: new Date().toISOString(),
+                    last_active_at: new Date().toISOString(),
+                    message_count: 0,
+                  },
+                ]
+              })
+              pushEvent({
+                id: crypto.randomUUID(),
+                type: 'memberJoined',
+                text: `${event.data.username} 加入了房间`,
+                timestamp: new Date().toISOString(),
+                agentColor: agent.color,
+              })
+              break
+            case 'memberLeft':
+              setOnlineMembers((prev) => prev.filter((m) => m.user_id !== event.data.user_id))
+              pushEvent({
+                id: crypto.randomUUID(),
+                type: 'memberLeft',
+                text: `${event.data.username} 离开了房间`,
+                timestamp: new Date().toISOString(),
+                agentColor: agent.color,
+              })
+              break
+            case 'error':
+              pushEvent({
+                id: crypto.randomUUID(),
+                type: 'error',
+                text: `错误: ${event.data.message}`,
+                timestamp: new Date().toISOString(),
+                agentColor: agent.color,
+              })
+              break
+          }
+        })
+
+        ws.connect()
+        wsClientsRef.current.set(localId, ws)
+      }
+
+      const doJoin = async (wsInstance: ChatWebSocket) => {
+        try {
+          await wsInstance.joinRoom(password)
+          updateAgentStatus(localId, 'connected', roomId)
+        } catch (err) {
+          console.error(`[DebugLab] ${agent.username} joinRoom 失败`, err)
+          updateAgentStatus(localId, 'error')
+          pushEvent({
+            id: crypto.randomUUID(),
+            type: 'error',
+            text: `${agent.username} joinRoom 失败: ${(err as Error).message ?? '未知错误'}`,
+            timestamp: new Date().toISOString(),
+            agentColor: agent.color,
+          })
+        }
+      }
+
+      if (ws.isConnected) {
+        await doJoin(ws)
+      } else {
+        const unsubStatus = ws.onStatus((s) => {
+          if (s === 'connected') {
+            unsubStatus()
+            doJoin(ws!)
+          }
+        })
+      }
+    }
+  }, [agents, updateAgentStatus, updateAgentCredentials, updateAgentId, pushMessage, pushEvent])
 
   const leaveRoom = useCallback(async (localId: string) => {
     const agent = agents.find((a) => a.localId === localId)
-    if (!agent || !agent.roomPassword) return
+    if (!agent || !agent.roomId || !agent.roomPassword) return
 
     const ws = wsClientsRef.current.get(localId)
     if (ws) {
-      ws.disconnect()
-      wsClientsRef.current.delete(localId)
+      ws.leaveRoom(agent.roomId)
     }
 
     try {
@@ -269,13 +453,15 @@ export function useSimulatedAgents() {
   }, [agents, updateAgentStatus])
 
   const sendMessage = useCallback((localId: string, text: string, mentions: MentionTarget[] = []) => {
+    const agent = agents.find((a) => a.localId === localId)
+    if (!agent?.roomId) return
     const ws = wsClientsRef.current.get(localId)
     if (!ws || !ws.isConnected) return
-    ws.sendMessage(text.trim(), mentions)
+    ws.sendMessage(agent.roomId, text.trim(), mentions)
     setAgents((prev) =>
       prev.map((a) => (a.localId === localId ? { ...a, inputText: '' } : a)),
     )
-  }, [])
+  }, [agents])
 
   const setInputText = useCallback((localId: string, text: string) => {
     setAgents((prev) =>
@@ -289,12 +475,11 @@ export function useSimulatedAgents() {
   }, [])
 
   const refreshOnlineMembers = useCallback(async () => {
-    // 从第一个已连接的 agent 获取在线成员列表
     for (const agent of agents) {
-      if (agent.status === 'connected') {
+      if (agent.status === 'connected' && agent.roomId) {
         const ws = wsClientsRef.current.get(agent.localId)
         if (ws) {
-          const members = await ws.getOnlineMembers()
+          const members = await ws.getOnlineMembers(agent.roomId)
           setOnlineMembers(members)
           return
         }

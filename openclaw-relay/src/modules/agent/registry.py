@@ -1,15 +1,19 @@
 import asyncio
-from typing import Dict, Optional, List
+import bcrypt
+import secrets
+from typing import Dict, Optional, List, Tuple
 from uuid import UUID, uuid4
 import structlog
 import httpx
 from datetime import datetime
 
+from .pg_repository import AgentRepository, AgentRecord
+
 logger = structlog.get_logger()
 
 
 class AgentCard:
-    """AgentCard模型（简化版）"""
+    """AgentCard 模型（简化版）"""
     def __init__(
         self,
         name: str,
@@ -28,8 +32,8 @@ class AgentCard:
         }
         self.last_checked = datetime.utcnow()
         self.status = "online"
-    
-    def to_dict(self) -> Dict[str, any]:
+
+    def to_dict(self) -> Dict:
         return {
             "name": self.name,
             "endpoint": self.endpoint,
@@ -42,7 +46,7 @@ class AgentCard:
 
 
 class AgentInfo:
-    """Agent信息"""
+    """Agent 内存信息对象"""
     def __init__(
         self,
         agent_id: str,
@@ -60,8 +64,10 @@ class AgentInfo:
         self.last_active = datetime.utcnow()
         self.status = "online"
         self.call_count = 0
-    
-    def to_dict(self) -> Dict[str, any]:
+        # 凭据 hash（从 DB 加载或注册时写入）
+        self.agent_secret_hash: Optional[str] = None
+
+    def to_dict(self) -> Dict:
         return {
             "agent_id": self.agent_id,
             "name": self.name,
@@ -75,96 +81,168 @@ class AgentInfo:
         }
 
 
+def _record_to_info(record: AgentRecord) -> AgentInfo:
+    """将 DB 记录转换为内存对象"""
+    agent_card = AgentCard(
+        name=record.name,
+        endpoint=record.endpoint or "",
+        description=record.description or "",
+        skills=record.skills or [],
+    )
+    info = AgentInfo(
+        agent_id=record.agent_id,
+        name=record.name,
+        endpoint=record.endpoint or "",
+        agent_card=agent_card,
+    )
+    info.agent_secret_hash = record.agent_secret_hash
+    info.status = record.status
+    return info
+
+
 class AgentRegistry:
-    """Agent注册表"""
-    
+    """Agent 注册表（内存缓存 + DB 持久化）"""
+
     def __init__(self):
-        self._agents: Dict[str, AgentInfo] = {}  # agent_id (UUID str) -> AgentInfo
-        self._agents_by_room: Dict[UUID, List[str]] = {}  # room_id -> [agent_id]
+        self._agents: Dict[str, AgentInfo] = {}
+        self._agents_by_room: Dict[UUID, List[str]] = {}
         self._lock = asyncio.Lock()
         self._http_client = httpx.AsyncClient(timeout=30.0)
-    
-    async def register_agent(
+        self._repo = AgentRepository()
+
+    # ------------------------------------------------------------------
+    # 注册与凭据管理
+    # ------------------------------------------------------------------
+
+    async def create_agent(
         self,
         name: str,
-        endpoint: str,
-        room_id: Optional[UUID] = None,
+        endpoint: Optional[str] = None,
         description: str = "",
         skills: List[str] = None,
-        capabilities: Dict[str, bool] = None,
-        agent_id: Optional[str] = None,
-    ) -> AgentInfo:
-        """注册Agent。agent_id 由服务端生成 UUID（或恢复时传入已有 ID）"""
-        # agent_id 由服务端分发，全局唯一；agentName 仅在同一 room 内唯一
-        if agent_id is None:
-            agent_id = str(uuid4())
-        
+    ) -> Tuple[AgentInfo, str]:
+        """新 Agent 注册：生成 agent_id + agent_secret，写入 DB，更新内存缓存。
+        返回 (AgentInfo, plain_secret)，plain_secret 仅此次明文返回。"""
+        existing = await self._repo.get_by_name(name)
+        if existing:
+            raise ValueError(f"Agent name '{name}' is already registered.")
+
+        agent_id = str(uuid4())
+        plain_secret = secrets.token_urlsafe(32)
+        secret_hash = bcrypt.hashpw(plain_secret.encode(), bcrypt.gensalt()).decode()
+
+        await self._repo.create(
+            agent_id=agent_id,
+            name=name,
+            agent_secret_hash=secret_hash,
+            endpoint=endpoint,
+            description=description,
+            skills=skills or [],
+        )
+
+        agent_card = AgentCard(
+            name=name,
+            endpoint=endpoint or "",
+            description=description,
+            skills=skills or [],
+        )
+        agent_info = AgentInfo(
+            agent_id=agent_id,
+            name=name,
+            endpoint=endpoint or "",
+            agent_card=agent_card,
+        )
+        agent_info.agent_secret_hash = secret_hash
+
         async with self._lock:
-            # 创建AgentCard
-            agent_card = AgentCard(
-                name=name,
-                endpoint=endpoint,
-                description=description,
-                skills=skills,
-                capabilities=capabilities
-            )
-            
-            # 创建AgentInfo
-            agent_info = AgentInfo(
-                agent_id=agent_id,
-                name=name,
-                endpoint=endpoint,
-                agent_card=agent_card,
-                room_id=room_id
-            )
-            
-            # 存储
             self._agents[agent_id] = agent_info
-            
-            if room_id:
-                if room_id not in self._agents_by_room:
-                    self._agents_by_room[room_id] = []
-                if agent_id not in self._agents_by_room[room_id]:
-                    self._agents_by_room[room_id].append(agent_id)
-            
-            logger.info(
-                "agent_registered",
-                agent_id=agent_id,
-                name=name,
-                endpoint=endpoint,
-                room_id=str(room_id) if room_id else None
-            )
-            
-            return agent_info
-    
+
+        logger.info("agent_created", agent_id=agent_id, name=name)
+        return agent_info, plain_secret
+
+    async def verify_agent(self, agent_id: str, plain_secret: str) -> Optional[AgentInfo]:
+        """验证 Agent 凭据。优先查内存缓存（含 hash），未命中则 fallback DB。"""
+        agent_info = self._agents.get(agent_id)
+        if agent_info and agent_info.agent_secret_hash:
+            if bcrypt.checkpw(plain_secret.encode(), agent_info.agent_secret_hash.encode()):
+                return agent_info
+            return None
+
+        # 内存未命中（如重启后未完全恢复），回查 DB
+        record = await self._repo.get_by_id(agent_id)
+        if not record:
+            return None
+        if not bcrypt.checkpw(plain_secret.encode(), record.agent_secret_hash.encode()):
+            return None
+
+        # 加载到内存缓存
+        info = _record_to_info(record)
+        async with self._lock:
+            self._agents[agent_id] = info
+        return info
+
+    async def restore_from_db(self) -> int:
+        """启动时从 agents 表恢复内存缓存，返回恢复的数量。"""
+        records = await self._repo.list_all()
+        count = 0
+        for record in records:
+            info = _record_to_info(record)
+            async with self._lock:
+                self._agents[record.agent_id] = info
+            count += 1
+        if count:
+            logger.info("agents_restored_from_db", count=count)
+        return count
+
+    async def add_agent_to_room(self, agent_id: str, room_id: UUID):
+        """Agent 加入房间后更新内存的 room 索引。"""
+        async with self._lock:
+            info = self._agents.get(agent_id)
+            if not info:
+                return
+            # 从旧房间移除
+            old_room = info.room_id
+            if old_room and old_room in self._agents_by_room:
+                if agent_id in self._agents_by_room[old_room]:
+                    self._agents_by_room[old_room].remove(agent_id)
+                    if not self._agents_by_room[old_room]:
+                        del self._agents_by_room[old_room]
+            # 加入新房间
+            info.room_id = room_id
+            if room_id not in self._agents_by_room:
+                self._agents_by_room[room_id] = []
+            if agent_id not in self._agents_by_room[room_id]:
+                self._agents_by_room[room_id].append(agent_id)
+
+    # ------------------------------------------------------------------
+    # 注销
+    # ------------------------------------------------------------------
+
     async def unregister_agent(self, agent_id: str) -> bool:
-        """注销Agent"""
+        """注销 Agent：从内存和 DB 中删除。"""
         async with self._lock:
             if agent_id not in self._agents:
                 return False
-            
-            agent_info = self._agents[agent_id]
-            
-            # 从房间索引中移除
+            agent_info = self._agents.pop(agent_id)
             if agent_info.room_id:
                 room_agents = self._agents_by_room.get(agent_info.room_id)
                 if room_agents and agent_id in room_agents:
                     room_agents.remove(agent_id)
                     if not room_agents:
                         del self._agents_by_room[agent_info.room_id]
-            
-            # 从主存储中移除
-            del self._agents[agent_id]
-            
-            logger.info("agent_unregistered", agent_id=agent_id)
-            return True
-    
+
+        await self._repo.delete(agent_id)
+        logger.info("agent_unregistered", agent_id=agent_id)
+        return True
+
+    # ------------------------------------------------------------------
+    # 查询
+    # ------------------------------------------------------------------
+
     async def get_agent(self, agent_id: str) -> Optional[AgentInfo]:
-        """获取Agent信息（按 UUID）"""
         return self._agents.get(agent_id)
-    
+
     async def get_agent_by_name_in_room(self, name: str, room_id: UUID) -> Optional[AgentInfo]:
-        """在指定房间内按 agentName 查找 Agent（用于后备 @mention 解析）"""
         agent_ids = self._agents_by_room.get(room_id, [])
         for aid in agent_ids:
             info = self._agents.get(aid)
@@ -173,31 +251,36 @@ class AgentRegistry:
         return None
 
     async def list_agents(self) -> List[AgentInfo]:
-        """获取所有Agent列表"""
         return list(self._agents.values())
-    
+
     async def list_agents_in_room(self, room_id: UUID) -> List[AgentInfo]:
-        """获取房间内的所有Agent"""
         agent_ids = self._agents_by_room.get(room_id, [])
-        return [self._agents[agent_id] for agent_id in agent_ids if agent_id in self._agents]
-    
+        return [self._agents[aid] for aid in agent_ids if aid in self._agents]
+
+    # ------------------------------------------------------------------
+    # 状态更新
+    # ------------------------------------------------------------------
+
     async def update_agent_status(self, agent_id: str, status: str) -> bool:
-        """更新Agent状态"""
         async with self._lock:
             if agent_id not in self._agents:
                 return False
-            
             self._agents[agent_id].status = status
             self._agents[agent_id].last_active = datetime.utcnow()
-            return True
-    
+        await self._repo.update_status(agent_id, status)
+        return True
+
+    # ------------------------------------------------------------------
+    # A2A HTTP 调用
+    # ------------------------------------------------------------------
+
     async def call_agent(
         self,
         agent_id: str,
         message: str,
-        context: Dict[str, any] = None
-    ) -> Dict[str, any]:
-        """调用Agent（A2A HTTP 协议）"""
+        context: Dict = None
+    ) -> Dict:
+        """通过 A2A HTTP 协议调用 Agent"""
         agent_info = await self.get_agent(agent_id)
         if not agent_info:
             raise ValueError(f"Agent {agent_id} not found")
@@ -216,7 +299,6 @@ class AgentRegistry:
         )
 
         try:
-            # A2A tasks/send 请求体
             payload = {
                 "id": task_id,
                 "message": {
@@ -235,51 +317,36 @@ class AgentRegistry:
             result = response.json()
 
             await self.update_agent_status(agent_id, "online")
-
-            logger.info(
-                "agent_a2a_response",
-                agent_id=agent_id,
-                task_id=task_id,
-                status=result.get("status"),
-            )
-
+            logger.info("agent_a2a_response", agent_id=agent_id, task_id=task_id)
             return result
 
         except Exception as e:
             await self.update_agent_status(agent_id, "error")
             logger.error("agent_a2a_call_failed", agent_id=agent_id, error=str(e))
             raise
-    
+
     async def ping_agent(self, agent_id: str) -> bool:
-        """Ping Agent检查连通性"""
+        """Ping Agent 检查连通性"""
         agent_info = await self.get_agent(agent_id)
         if not agent_info:
             return False
-        
         try:
-            # 尝试访问Agent端点
             response = await self._http_client.get(
                 f"{agent_info.endpoint}/health",
                 timeout=5.0
             )
-            
             is_online = response.status_code == 200
-            status = "online" if is_online else "offline"
-            await self.update_agent_status(agent_id, status)
-            
+            await self.update_agent_status(agent_id, "online" if is_online else "offline")
             return is_online
-            
         except Exception as e:
             await self.update_agent_status(agent_id, "offline")
             logger.warning("agent_ping_failed", agent_id=agent_id, error=str(e))
             return False
-    
+
     async def cleanup(self):
-        """清理资源"""
         await self._http_client.aclose()
-    
+
     def __del__(self):
-        """析构函数"""
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self.cleanup())

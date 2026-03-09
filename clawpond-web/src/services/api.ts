@@ -44,6 +44,7 @@ export interface CreateRoomParams {
 }
 
 export interface JoinRoomParams {
+  room_id?: string
   user_id: string
   username: string
   /** access_token，由创建房间时服务端生成并一次性返回的 plain_password */
@@ -128,15 +129,42 @@ export async function listAgents(room_id?: string) {
   return res.data
 }
 
+/** Agent 注册响应 — agent_secret 仅此次明文返回 */
+export interface AgentRegisterResponse {
+  agent_id: string
+  agent_secret: string
+  name: string
+  message: string
+}
+
+/** 注册新 Agent（仅获取身份凭据，不加入房间） */
 export async function registerAgent(params: {
   name: string
-  endpoint: string
-  room_id: string
-  room_password: string
+  endpoint?: string
   description?: string
   skills?: string[]
-}) {
-  const res = await api.post(`/api/v1/agents/register`, params)
+}): Promise<AgentRegisterResponse> {
+  const res = await api.post<AgentRegisterResponse>(`/api/v1/agents/register`, params)
+  return res.data
+}
+
+/** Agent 加入房间响应 */
+export interface AgentJoinResponse {
+  agent_id: string
+  user_id: string
+  username: string
+  room_id: string
+  message: string
+}
+
+/** Agent 凭 agent_id + agent_secret + room_password 加入房间 */
+export async function agentJoinRoom(params: {
+  agent_id: string
+  agent_secret: string
+  room_id: string
+  room_password: string
+}): Promise<AgentJoinResponse> {
+  const res = await api.post<AgentJoinResponse>(`/api/v1/agents/join`, params)
   return res.data
 }
 

@@ -14,47 +14,26 @@ logger = structlog.get_logger()
 
 
 class ConnectionInfo:
-    """WebSocket连接信息"""
+    """WebSocket连接信息（与房间无关，单用户单连接）"""
     def __init__(
         self,
         websocket: WebSocket,
         user_id: str,
         username: str,
         user_type: str,
-        room_id: UUID,
-        role: str = "member",
-        agent_id: Optional[str] = None,
     ):
         self.websocket = websocket
         self.user_id = user_id
         self.username = username
         self.user_type = user_type
-        self.room_id = room_id
-        self.role = role
-        self.agent_id = agent_id  # 服务端分发的 UUID（仅 agent 有值）
         self.connected_at = datetime.utcnow()
         self.last_active_at = datetime.utcnow()
         self.message_count = 0
-    
-    def to_dict(self) -> Dict[str, any]:
-        """转换为字典"""
-        d = {
-            "user_id": self.user_id,
-            "username": self.username,
-            "user_type": self.user_type,
-            "role": self.role,
-            "connected_at": self.connected_at.isoformat(),
-            "last_active_at": self.last_active_at.isoformat(),
-            "message_count": self.message_count,
-        }
-        if self.agent_id:
-            d["agent_id"] = self.agent_id
-        return d
 
 
 class WebSocketManager:
-    """WebSocket连接管理器"""
-    
+    """WebSocket连接管理器（每用户/Agent 维护单条全局连接，服务端按房间订阅分发消息）"""
+
     def __init__(
         self,
         room_service: RoomService,
@@ -62,110 +41,67 @@ class WebSocketManager:
     ):
         self.room_service = room_service
         self.message_service = message_service
-        
-        # 连接存储结构: room_id -> {user_id: ConnectionInfo}
-        self.connections: Dict[str, Dict[str, ConnectionInfo]] = {}
+
+        # user_id → ConnectionInfo（每用户单连接）
+        self.user_connections: Dict[str, ConnectionInfo] = {}
+        # user_id → Set[room_id str]（用户已订阅的房间集合）
+        self.user_rooms: Dict[str, Set[str]] = {}
+        # room_id str → Set[user_id str]（房间内在线用户，用于广播）
+        self.room_users: Dict[str, Set[str]] = {}
+        # room_id str → user_id str → {"role": str, "agent_id": str|None}
+        self.room_member_meta: Dict[str, Dict[str, Dict]] = {}
+
         self._lock = asyncio.Lock()
-    
+
+    # ------------------------------------------------------------------
+    # 连接生命周期
+    # ------------------------------------------------------------------
+
     async def connect(
         self,
         websocket: WebSocket,
-        room_id: UUID,
         user_id: str,
         username: str,
         user_type: str = "human",
-        role: str = "member"
     ) -> bool:
-        """建立WebSocket连接"""
+        """建立 WebSocket 连接（不加入任何房间，仅完成身份确认）"""
         try:
             await websocket.accept()
-            
-            # 验证用户是否在房间中
-            member = await self.room_service.get_member(room_id, user_id)
-            if not member:
-                logger.warning("user_not_in_room", room_id=str(room_id), user_id=user_id)
-                await websocket.close(code=4001, reason="User not in room")
-                return False
-            
-            # 从 DB 成员记录中取 agent_id（仅 agent 有值）
-            agent_id = getattr(member, 'agent_id', None)
 
-            room_key = str(room_id)
             old_ws_to_close = None
 
-            # 在锁内只做状态修改，不发任何网络消息（避免死锁）
             async with self._lock:
-                if room_key not in self.connections:
-                    self.connections[room_key] = {}
-
-                # 记录旧连接待关闭
-                if user_id in self.connections[room_key]:
-                    old_ws_to_close = self.connections[room_key][user_id].websocket
+                if user_id in self.user_connections:
+                    old_ws_to_close = self.user_connections[user_id].websocket
 
                 connection = ConnectionInfo(
                     websocket=websocket,
                     user_id=user_id,
                     username=username,
                     user_type=user_type,
-                    room_id=room_id,
-                    role=role,
-                    agent_id=agent_id,
                 )
-                self.connections[room_key][user_id] = connection
+                self.user_connections[user_id] = connection
 
-            # 锁外处理旧连接关闭
+                if user_id not in self.user_rooms:
+                    self.user_rooms[user_id] = set()
+
+            # 锁外关闭旧连接，避免持锁执行 IO
             if old_ws_to_close:
                 try:
                     await old_ws_to_close.close(code=4002, reason="New connection established")
                 except Exception:
                     pass
 
-            # 锁外更新成员状态
-            await self.room_service.update_member_status(
-                room_id, user_id, MemberStatus.ONLINE
-            )
+            logger.info("websocket_connected", user_id=user_id, username=username)
 
-            logger.info(
-                "websocket_connected",
-                room_id=room_key,
-                user_id=user_id,
-                username=username
-            )
-
-            # 锁外广播成员加入事件，agent 携带 agent_id
-            member_joined_data: Dict[str, any] = {
-                "user_id": user_id,
-                "username": username,
-                "user_type": user_type,
-                "role": role,
-                "online": True,
-            }
-            if agent_id:
-                member_joined_data["agent_id"] = agent_id
-
-            await self.broadcast_to_room(
-                room_id,
-                {"event": "memberJoined", "data": member_joined_data},
-                exclude_user_id=user_id
-            )
-
-            # 锁外发送 connected 事件，包含 agent_id（供插件自我识别）
-            connected_data: Dict[str, any] = {
-                "room_id": str(room_id),
-                "user_id": user_id,
-                "username": username,
-                "online_members": await self.get_online_members(room_id),
-            }
-            if agent_id:
-                connected_data["agent_id"] = agent_id
-
-            await self.send_to_user(
-                room_id, user_id,
-                {"event": "connected", "data": connected_data}
-            )
+            # 发送 connected 事件确认身份
+            await self.send_to_user(user_id, {
+                "event": "connected",
+                "data": {"user_id": user_id, "username": username},
+            })
 
             return True
-                
+
         except Exception as e:
             logger.error("websocket_connect_error", error=str(e))
             try:
@@ -173,175 +109,315 @@ class WebSocketManager:
             except Exception:
                 pass
             return False
-    
-    async def disconnect(
-        self,
-        room_id: UUID,
-        user_id: str
-    ):
-        """断开WebSocket连接"""
-        room_key = str(room_id)
-        disconnected_username = None
 
-        # 在锁内只做状态修改
+    async def disconnect(self, user_id: str):
+        """断开连接，自动退出所有已订阅房间"""
+        username = None
+        rooms_to_leave: List[str] = []
+
         async with self._lock:
-            if room_key in self.connections and user_id in self.connections[room_key]:
-                connection = self.connections[room_key].pop(user_id)
-                disconnected_username = connection.username
+            conn = self.user_connections.pop(user_id, None)
+            if conn:
+                username = conn.username
 
-                if not self.connections[room_key]:
-                    del self.connections[room_key]
+            rooms_to_leave = list(self.user_rooms.pop(user_id, set()))
 
-        if disconnected_username is None:
+            for room_key in rooms_to_leave:
+                if room_key in self.room_users:
+                    self.room_users[room_key].discard(user_id)
+                    if not self.room_users[room_key]:
+                        del self.room_users[room_key]
+                if room_key in self.room_member_meta:
+                    self.room_member_meta[room_key].pop(user_id, None)
+                    if not self.room_member_meta[room_key]:
+                        del self.room_member_meta[room_key]
+
+        if not username:
             return
 
-        # 锁外做 IO 操作
-        await self.room_service.update_member_status(
-            room_id, user_id, MemberStatus.OFFLINE
-        )
+        logger.info("websocket_disconnected", user_id=user_id)
 
-        logger.info(
-            "websocket_disconnected",
-            room_id=room_key,
-            user_id=user_id
-        )
-
-        # 锁外广播成员离开事件
-        await self.broadcast_to_room(
-            room_id,
-            {
-                "event": "memberLeft",
-                "data": {
-                    "user_id": user_id,
-                    "username": disconnected_username,
-                    "online": False,
-                }
-            },
-            exclude_user_id=user_id
-        )
-    
-    async def send_to_user(
-        self,
-        room_id: UUID,
-        user_id: str,
-        message: Dict[str, any]
-    ) -> bool:
-        """向指定用户发送消息"""
-        try:
-            room_key = str(room_id)
-
-            # 在锁内只获取连接引用，不做网络 I/O
-            async with self._lock:
-                if room_key not in self.connections:
-                    return False
-                if user_id not in self.connections[room_key]:
-                    return False
-                connection = self.connections[room_key][user_id]
-
-            # 在锁外执行网络发送，避免持锁时 I/O 阻塞
+        # 对每个已订阅房间执行状态更新和广播
+        for room_key in rooms_to_leave:
             try:
-                await connection.websocket.send_json(message)
+                room_id = UUID(room_key)
+                await self.room_service.update_member_status(
+                    room_id, user_id, MemberStatus.OFFLINE
+                )
+                await self.broadcast_to_room(
+                    room_id,
+                    {
+                        "event": "memberLeft",
+                        "data": {
+                            "room_id": room_key,
+                            "user_id": user_id,
+                            "username": username,
+                            "online": False,
+                        },
+                    },
+                    exclude_user_id=user_id,
+                )
+            except Exception as e:
+                logger.error("disconnect_room_cleanup_error", room_id=room_key, error=str(e))
+
+    # ------------------------------------------------------------------
+    # 房间订阅管理
+    # ------------------------------------------------------------------
+
+    async def handle_join_room(self, user_id: str, password: str) -> Dict:
+        """处理加入房间请求，订阅房间消息"""
+        if not password:
+            return {"event": "error", "data": {"message": "Room password required"}}
+
+        room = await self.room_service.get_room_by_password(password)
+        if not room:
+            return {"event": "error", "data": {"message": "Room not found or invalid password"}}
+
+        room_id = room.id
+        room_key = str(room_id)
+
+        member = await self.room_service.get_member(room_id, user_id)
+        if not member:
+            return {"event": "error", "data": {"message": "User not in room"}}
+
+        agent_id = getattr(member, "agent_id", None)
+        role = str(getattr(member, "role", "member"))
+
+        async with self._lock:
+            conn = self.user_connections.get(user_id)
+            if not conn:
+                return {"event": "error", "data": {"message": "Not connected"}}
+
+            user_type = conn.user_type
+            username = conn.username
+
+            # 已订阅则幂等返回
+            already_joined = room_key in self.user_rooms.get(user_id, set())
+
+            if room_key not in self.room_users:
+                self.room_users[room_key] = set()
+            self.room_users[room_key].add(user_id)
+
+            if user_id not in self.user_rooms:
+                self.user_rooms[user_id] = set()
+            self.user_rooms[user_id].add(room_key)
+
+            if room_key not in self.room_member_meta:
+                self.room_member_meta[room_key] = {}
+            self.room_member_meta[room_key][user_id] = {
+                "role": role,
+                "agent_id": str(agent_id) if agent_id else None,
+            }
+
+        await self.room_service.update_member_status(room_id, user_id, MemberStatus.ONLINE)
+
+        if not already_joined:
+            member_joined_data: Dict = {
+                "room_id": room_key,
+                "user_id": user_id,
+                "username": username,
+                "user_type": user_type,
+                "role": role,
+                "online": True,
+            }
+            if agent_id:
+                member_joined_data["agent_id"] = str(agent_id)
+
+            await self.broadcast_to_room(
+                room_id,
+                {"event": "memberJoined", "data": member_joined_data},
+                exclude_user_id=user_id,
+            )
+
+        logger.info("room_joined", room_id=room_key, user_id=user_id)
+
+        room_joined_data: Dict = {
+            "room_id": room_key,
+            "room_name": room.name,
+            "online_members": await self.get_online_members(room_id),
+        }
+        if agent_id:
+            room_joined_data["agent_id"] = str(agent_id)
+
+        return {"event": "roomJoined", "data": room_joined_data}
+
+    async def handle_leave_room(self, user_id: str, room_id_str: str) -> Dict:
+        """处理离开房间请求，取消订阅"""
+        if not room_id_str:
+            return {"event": "error", "data": {"message": "room_id required"}}
+
+        try:
+            room_id = UUID(room_id_str)
+        except ValueError:
+            return {"event": "error", "data": {"message": "Invalid room_id"}}
+
+        room_key = room_id_str
+        username = None
+
+        async with self._lock:
+            conn = self.user_connections.get(user_id)
+            if conn:
+                username = conn.username
+
+            if room_key in self.room_users:
+                self.room_users[room_key].discard(user_id)
+                if not self.room_users[room_key]:
+                    del self.room_users[room_key]
+
+            if user_id in self.user_rooms:
+                self.user_rooms[user_id].discard(room_key)
+
+            if room_key in self.room_member_meta:
+                self.room_member_meta[room_key].pop(user_id, None)
+                if not self.room_member_meta[room_key]:
+                    del self.room_member_meta[room_key]
+
+        await self.room_service.update_member_status(room_id, user_id, MemberStatus.OFFLINE)
+
+        if username:
+            await self.broadcast_to_room(
+                room_id,
+                {
+                    "event": "memberLeft",
+                    "data": {
+                        "room_id": room_key,
+                        "user_id": user_id,
+                        "username": username,
+                        "online": False,
+                    },
+                },
+                exclude_user_id=user_id,
+            )
+
+        logger.info("room_left", room_id=room_key, user_id=user_id)
+        return {"event": "roomLeft", "data": {"room_id": room_key}}
+
+    # ------------------------------------------------------------------
+    # 消息收发
+    # ------------------------------------------------------------------
+
+    async def send_to_user(self, user_id: str, message: Dict) -> bool:
+        """向指定用户发送消息（无需指定房间）"""
+        try:
+            async with self._lock:
+                conn = self.user_connections.get(user_id)
+                if not conn:
+                    return False
+
+            try:
+                await conn.websocket.send_json(message)
                 async with self._lock:
-                    # 更新活跃时间（连接可能已被替换，需再次确认）
-                    if (room_key in self.connections
-                            and user_id in self.connections[room_key]
-                            and self.connections[room_key][user_id] is connection):
-                        self.connections[room_key][user_id].last_active_at = datetime.utcnow()
+                    if (
+                        user_id in self.user_connections
+                        and self.user_connections[user_id] is conn
+                    ):
+                        self.user_connections[user_id].last_active_at = datetime.utcnow()
                 return True
             except Exception as e:
-                logger.error(
-                    "send_to_user_failed",
-                    room_id=room_key,
-                    user_id=user_id,
-                    error=str(e)
-                )
-                # 锁外调用 disconnect，避免死锁
-                await self.disconnect(room_id, user_id)
+                logger.error("send_to_user_failed", user_id=user_id, error=str(e))
+                await self.disconnect(user_id)
                 return False
 
         except Exception as e:
             logger.error("send_to_user_error", error=str(e))
             return False
-    
+
     async def broadcast_to_room(
         self,
         room_id: UUID,
-        message: Dict[str, any],
-        exclude_user_id: Optional[str] = None
+        message: Dict,
+        exclude_user_id: Optional[str] = None,
     ):
         """广播消息给房间内所有在线用户"""
         room_key = str(room_id)
-        
+
         async with self._lock:
-            if room_key not in self.connections:
-                return
-            
-            connections = list(self.connections[room_key].items())
-            
-        # 在锁外发送消息，避免阻塞
+            user_ids = list(self.room_users.get(room_key, set()))
+
         tasks = []
-        for user_id, connection in connections:
-            if user_id == exclude_user_id:
+        for uid in user_ids:
+            if uid == exclude_user_id:
                 continue
-            
-            tasks.append(self.send_to_user(room_id, user_id, message))
-        
-        # 并行发送
+            tasks.append(self.send_to_user(uid, message))
+
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-    
-    async def handle_message(
-        self,
-        room_id: UUID,
-        user_id: str,
-        data: Dict[str, any]
-    ) -> Dict[str, any]:
-        """处理WebSocket消息"""
+
+    async def handle_message(self, user_id: str, data: Dict) -> Optional[Dict]:
+        """分发处理 WebSocket 消息"""
         logger.info(
             "ws_raw_message_received",
-            room_id=str(room_id),
             user_id=user_id,
             raw=json.dumps(data, ensure_ascii=False, default=str),
         )
         method = data.get("method")
-        
-        if method == "sendMessage":
-            return await self._handle_send_message(room_id, user_id, data.get("params", {}))
+        params = data.get("params", {})
+
+        if method == "joinRoom":
+            return await self.handle_join_room(user_id, params.get("password", ""))
+
+        elif method == "leaveRoom":
+            return await self.handle_leave_room(user_id, params.get("room_id", ""))
+
+        elif method == "sendMessage":
+            room_id_str = params.get("room_id", "")
+            if not room_id_str:
+                return {"error": "room_id required"}
+            try:
+                room_id = UUID(room_id_str)
+            except ValueError:
+                return {"error": "Invalid room_id"}
+            if not self.is_connected(room_id, user_id):
+                return {"error": "Not joined in room"}
+            return await self._handle_send_message(room_id, user_id, params)
+
         elif method == "ping":
             return {"method": "pong"}
+
         elif method == "getOnlineMembers":
+            room_id_str = params.get("room_id", "")
+            if not room_id_str:
+                return {"error": "room_id required"}
+            try:
+                room_id = UUID(room_id_str)
+            except ValueError:
+                return {"error": "Invalid room_id"}
             return {
                 "method": "onlineMembers",
-                "data": await self.get_online_members(room_id)
+                "data": await self.get_online_members(room_id),
             }
+
         elif method == "getRecentMessages":
-            limit = data.get("params", {}).get("limit", 20)
+            room_id_str = params.get("room_id", "")
+            if not room_id_str:
+                return {"error": "room_id required"}
+            try:
+                room_id = UUID(room_id_str)
+            except ValueError:
+                return {"error": "Invalid room_id"}
+            limit = params.get("limit", 20)
             messages = await self.message_service.get_recent_messages(room_id, limit)
             return {
                 "method": "recentMessages",
-                "data": [msg.to_dict() for msg in messages]
+                "data": [msg.to_dict() for msg in messages],
             }
+
         else:
-            return {
-                "error": "Unknown method",
-                "method": method
-            }
-    
+            return {"error": "Unknown method", "method": method}
+
     async def _handle_send_message(
         self,
         room_id: UUID,
         user_id: str,
-        params: Dict[str, any]
-    ) -> Dict[str, any]:
+        params: Dict,
+    ) -> Dict:
         """处理发送消息请求"""
-        # 获取用户信息
         member = await self.room_service.get_member(room_id, user_id)
         if not member:
             return {"error": "User not in room"}
-        
-        # 创建消息
+
         from ...schemas.message import MessageCreate
-        
+
         message_data = MessageCreate(
             room_id=room_id,
             sender_id=user_id,
@@ -352,78 +428,89 @@ class WebSocketManager:
             attachments=params.get("attachments"),
             metadata=params.get("metadata"),
         )
-        
+
         try:
-            # 发送消息
             message = await self.message_service.send_message(message_data)
-            
-            # 广播消息给房间内所有用户
+
             await self.broadcast_to_room(
                 room_id,
-                {
-                    "event": "message",
-                    "data": message.to_dict()
-                }
+                {"event": "message", "data": message.to_dict()},
             )
-            
-            # 记录消息发送
+
             room_key = str(room_id)
-            if room_key in self.connections and user_id in self.connections[room_key]:
-                self.connections[room_key][user_id].message_count += 1
-            
-            return {
-                "method": "messageSent",
-                "data": message.to_dict()
-            }
-            
+            async with self._lock:
+                if user_id in self.user_connections:
+                    self.user_connections[user_id].message_count += 1
+
+            return {"method": "messageSent", "data": message.to_dict()}
+
         except Exception as e:
             logger.error("send_message_failed", error=str(e))
             return {"error": str(e)}
-    
-    async def get_online_members(self, room_id: UUID) -> List[Dict[str, any]]:
-        """获取在线成员列表"""
+
+    # ------------------------------------------------------------------
+    # 查询工具
+    # ------------------------------------------------------------------
+
+    async def get_online_members(self, room_id: UUID) -> List[Dict]:
+        """获取房间在线成员列表"""
         room_key = str(room_id)
-        
+
         async with self._lock:
-            if room_key not in self.connections:
-                return []
-            
-            return [
-                connection.to_dict()
-                for connection in self.connections[room_key].values()
-            ]
-    
+            user_ids = list(self.room_users.get(room_key, set()))
+            result = []
+            for uid in user_ids:
+                conn = self.user_connections.get(uid)
+                if not conn:
+                    continue
+                meta = self.room_member_meta.get(room_key, {}).get(uid, {})
+                d: Dict = {
+                    "user_id": conn.user_id,
+                    "username": conn.username,
+                    "user_type": conn.user_type,
+                    "role": meta.get("role", "member"),
+                    "connected_at": conn.connected_at.isoformat(),
+                    "last_active_at": conn.last_active_at.isoformat(),
+                    "message_count": conn.message_count,
+                }
+                agent_id = meta.get("agent_id")
+                if agent_id:
+                    d["agent_id"] = agent_id
+                result.append(d)
+        return result
+
     async def get_connection_count(self, room_id: UUID) -> int:
         """获取房间连接数"""
         room_key = str(room_id)
-        
         async with self._lock:
-            if room_key not in self.connections:
-                return 0
-            
-            return len(self.connections[room_key])
-    
+            return len(self.room_users.get(room_key, set()))
+
     async def get_total_connection_count(self) -> int:
-        """获取总连接数"""
+        """获取总连接数（按用户计）"""
         async with self._lock:
-            total = 0
-            for connections in self.connections.values():
-                total += len(connections)
-            return total
+            return len(self.user_connections)
 
     def is_connected(self, room_id: UUID, user_id: str) -> bool:
-        """检查指定用户是否有活跃的 WebSocket 连接（同步，供 MessageService 注入使用）"""
-        return user_id in self.connections.get(str(room_id), {})
-    
+        """检查用户是否已订阅该房间且 WebSocket 在线（同步，供 MessageService 注入使用）"""
+        room_key = str(room_id)
+        return (
+            user_id in self.room_users.get(room_key, set())
+            and user_id in self.user_connections
+        )
+
+    # ------------------------------------------------------------------
+    # 系统消息 / 提及通知
+    # ------------------------------------------------------------------
+
     async def send_system_message(
         self,
         room_id: UUID,
         text: str,
-        metadata: Optional[Dict[str, any]] = None
+        metadata: Optional[Dict] = None,
     ):
         """发送系统消息"""
         from ...schemas.message import MessageCreate
-        
+
         message_data = MessageCreate(
             room_id=room_id,
             sender_id="system",
@@ -432,22 +519,16 @@ class WebSocketManager:
             type="system",
             metadata=metadata or {},
         )
-        
+
         try:
             message = await self.message_service.send_message(message_data)
-            
-            # 广播系统消息
             await self.broadcast_to_room(
                 room_id,
-                {
-                    "event": "systemMessage",
-                    "data": message.to_dict()
-                }
+                {"event": "systemMessage", "data": message.to_dict()},
             )
-            
         except Exception as e:
             logger.error("send_system_message_failed", error=str(e))
-    
+
     async def notify_mention(
         self,
         room_id: UUID,
@@ -455,11 +536,10 @@ class WebSocketManager:
         mentioner_id: str,
         mentioner_name: str,
         message_text: str,
-        message_id: int
+        message_id: int,
     ):
         """通知被提及的用户"""
         await self.send_to_user(
-            room_id,
             mentioned_user_id,
             {
                 "event": "mentioned",
@@ -467,9 +547,13 @@ class WebSocketManager:
                     "room_id": str(room_id),
                     "mentioner_id": mentioner_id,
                     "mentioner_name": mentioner_name,
-                    "message_text": message_text[:100] + "..." if len(message_text) > 100 else message_text,
+                    "message_text": (
+                        message_text[:100] + "..."
+                        if len(message_text) > 100
+                        else message_text
+                    ),
                     "message_id": message_id,
                     "timestamp": datetime.utcnow().isoformat(),
-                }
-            }
+                },
+            },
         )

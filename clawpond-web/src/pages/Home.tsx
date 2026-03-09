@@ -71,6 +71,7 @@ export default function Home({ userId, username, onEnterRoom, onOpenDebugLab, on
     setJoinError('')
     try {
       await joinRoom({
+        room_id: joinModal.roomId,
         user_id: userId,
         username: username,
         password: joinPassword,

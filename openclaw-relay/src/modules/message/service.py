@@ -60,6 +60,13 @@ class MessageService:
         # 客户端传来的 mentions 格式为 [{"agentId": "uuid", "username": "name"}, ...]
         # 或后备格式 ["username", ...]（纯文本解析）
         structured_mentions = await self._resolve_mentions(data.room_id, data.text, data.mentions)
+        logger.info(
+            "mentions_resolved",
+            room_id=str(data.room_id),
+            sender_id=data.sender_id,
+            raw_mentions=data.mentions,
+            resolved_mentions=structured_mentions,
+        )
         
         # 创建消息，mentions 存储为结构化列表
         message = Message(
@@ -118,13 +125,21 @@ class MessageService:
         # 1. 优先处理客户端传来的结构化 mentions
         if client_mentions:
             for item in client_mentions:
-                if isinstance(item, dict) and "agentId" in item:
-                    agent_id = item["agentId"]
-                    username = item.get("username", "")
-                    if agent_id not in seen_ids:
-                        seen_ids.add(agent_id)
-                        result.append({"agentId": agent_id, "username": username})
-                    continue
+                if isinstance(item, dict):
+                    if "agentId" in item:
+                        agent_id = item["agentId"]
+                        username = item.get("username", "")
+                        if agent_id not in seen_ids:
+                            seen_ids.add(agent_id)
+                            result.append({"agentId": agent_id, "username": username})
+                        continue
+                    if "userId" in item:
+                        user_id = item["userId"]
+                        username = item.get("username", "")
+                        if user_id not in seen_ids:
+                            seen_ids.add(user_id)
+                            result.append({"userId": user_id, "username": username})
+                        continue
                 # 兼容旧格式：纯字符串 username
                 if isinstance(item, str):
                     agent_info = await self._agent_registry.get_agent_by_name_in_room(item, room_id) if self._agent_registry else None
@@ -135,12 +150,30 @@ class MessageService:
         # 2. 后备：从文本中解析 @mention，在当前 room 成员里查
         import re
         text_mentions = re.findall(r'@([a-zA-Z0-9_\-]+)', text)
-        if text_mentions and self._agent_registry:
+        if text_mentions:
+            # 提前获取房间成员列表，供 agent 查找失败时回退使用
+            room_members = await self.room_service.get_members(room_id)
             for username in set(text_mentions):
-                agent_info = await self._agent_registry.get_agent_by_name_in_room(username, room_id)
-                if agent_info and agent_info.agent_id not in seen_ids:
-                    seen_ids.add(agent_info.agent_id)
-                    result.append({"agentId": agent_info.agent_id, "username": agent_info.name})
+                # 先查 AgentRegistry（agent 成员）
+                agent_info = None
+                if self._agent_registry:
+                    agent_info = await self._agent_registry.get_agent_by_name_in_room(username, room_id)
+                if agent_info:
+                    if agent_info.agent_id not in seen_ids:
+                        seen_ids.add(agent_info.agent_id)
+                        result.append({"agentId": agent_info.agent_id, "username": agent_info.name})
+                    # else: 已在 result 中，跳过
+                else:
+                    # AgentRegistry 未找到，在房间成员中按 username 查找
+                    for m in room_members:
+                        if m.username.lower() == username.lower() and m.user_id not in seen_ids:
+                            seen_ids.add(m.user_id)
+                            # agent 成员用 agentId 格式（保证 _trigger_agent_responses 能触发）
+                            if m.agent_id:
+                                result.append({"agentId": m.agent_id, "username": m.username})
+                            else:
+                                result.append({"userId": m.user_id, "username": m.username})
+                            break
 
         return result
 

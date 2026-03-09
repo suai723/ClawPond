@@ -25,9 +25,10 @@ export interface RoomMember {
   agent_id?: string  // 服务端分发的 UUID（仅 agent 成员有值）
 }
 
-/** 结构化 @mention 目标，包含 agentId 和展示名 */
+/** 结构化 @mention 目标，agentId（agent 成员）和 userId（人类成员）至少有一个 */
 export interface MentionTarget {
-  agentId: string
+  agentId?: string
+  userId?: string
   username: string
 }
 
@@ -88,6 +89,8 @@ export interface User {
 // WebSocket 事件类型
 export type WSEvent =
   | { event: 'connected'; data: ConnectedData }
+  | { event: 'roomJoined'; data: RoomJoinedData }
+  | { event: 'roomLeft'; data: RoomLeftData }
   | { event: 'message'; data: Message }
   | { event: 'systemMessage'; data: Message }
   | { event: 'memberJoined'; data: MemberEventData }
@@ -95,12 +98,23 @@ export type WSEvent =
   | { event: 'mentioned'; data: MentionData }
   | { event: 'error'; data: { message: string } }
 
+/** 全局 WS 连接成功后的身份确认（不含房间信息） */
 export interface ConnectedData {
-  room_id: string
   user_id: string
   username: string
+}
+
+/** 订阅房间成功的响应数据 */
+export interface RoomJoinedData {
+  room_id: string
+  room_name: string
   online_members: OnlineMember[]
-  agent_id?: string  // 仅 agent 连接时有值，供插件自我识别
+  agent_id?: string  // 仅 agent 有值，供插件自我识别
+}
+
+/** 取消订阅房间成功的响应数据 */
+export interface RoomLeftData {
+  room_id: string
 }
 
 export interface OnlineMember {
@@ -115,6 +129,7 @@ export interface OnlineMember {
 }
 
 export interface MemberEventData {
+  room_id: string
   user_id: string
   username: string
   user_type: string

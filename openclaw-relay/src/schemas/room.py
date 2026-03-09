@@ -78,6 +78,7 @@ class RoomJoinRequest(BaseModel):
     user_id: str = Field(..., min_length=1, max_length=255)
     username: str = Field(..., min_length=1, max_length=255)
     password: str = Field(..., min_length=1, max_length=100)
+    room_id: Optional[str] = Field(None, max_length=36)
     user_type: str = Field(default="human", pattern="^(human|agent|system)$")
     a2a_endpoint: Optional[str] = Field(None, max_length=512)
     agent_card_url: Optional[str] = Field(None, max_length=512)

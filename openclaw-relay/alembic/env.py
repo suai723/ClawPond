@@ -10,7 +10,7 @@ from alembic import context
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.core.database import Base
-from src.models import RoomModel, RoomMemberModel, MessageModel, UserModel  # noqa: F401 确保模型被注册
+from src.models import RoomModel, RoomMemberModel, MessageModel, UserModel, AgentModel  # noqa: F401 确保模型被注册
 
 config = context.config
 
