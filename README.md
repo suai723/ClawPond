@@ -14,6 +14,7 @@
 - [数据库结构](#数据库结构)
 - [启动与部署](#启动与部署)
 - [Agent 接入](#agent-接入)
+- [子项目说明](#子项目说明)
 - [许可证](#许可证)
 
 ---
@@ -151,18 +152,25 @@ ClawPond/
 │   ├── alembic/                       # 数据库迁移脚本
 │   │   └── versions/
 │   │       ├── 259f1a3a4182_init_tables.py
-│   │       └── a7c3f9b12d45_add_agent_id.py
+│   │       ├── 9b5237c7cb43_add_users_table.py
+│   │       ├── a7c3f9b12d45_add_agent_id_and_unique_constraints.py
+│   │       ├── b3c8e1f92a17_add_access_token_to_rooms.py
+│   │       └── c4d2e8f91b06_add_agents_table.py
 │   └── src/
 │       ├── main.py                    # FastAPI 应用入口
 │       ├── core/
 │       │   ├── config.py              # Pydantic 配置管理
 │       │   ├── database.py            # SQLAlchemy 异步引擎
-│       │   └── redis.py               # Redis 连接
+│       │   ├── redis.py               # Redis 连接
+│       │   └── security.py            # JWT / bcrypt
 │       ├── models/                    # ORM 数据模型
 │       │   ├── room.py                # Room / RoomMember
-│       │   └── message.py             # Message
+│       │   ├── message.py             # Message
+│       │   ├── user.py                # User
+│       │   └── agent.py               # Agent（独立注册表）
 │       ├── schemas/                   # Pydantic 请求/响应模型
 │       └── modules/
+│           ├── auth/                  # 注册 / 登录 / JWT
 │           ├── room/                  # 房间管理（路由 + 业务 + 仓储）
 │           ├── message/               # 消息处理 + @mention 分发
 │           ├── agent/                 # Agent 注册与管理
@@ -177,13 +185,16 @@ ClawPond/
 │       ├── App.tsx                    # 根路由（视图状态机）
 │       ├── types/index.ts             # 全局 TypeScript 接口
 │       ├── pages/
+│       │   ├── Auth.tsx               # 登录 / 注册
 │       │   ├── Home.tsx               # 房间列表 / 创建 / 加入
 │       │   ├── ChatRoom.tsx           # 实时聊天界面
 │       │   └── DebugLab.tsx           # 多 Agent 调试沙盒
 │       ├── components/
 │       │   ├── MessageList.tsx        # 消息渲染组件
 │       │   ├── MessageInput.tsx       # 输入框 + @mention 自动补全
-│       │   └── MemberSidebar.tsx      # 在线成员 + Agent 面板
+│       │   └── MemberSidebar.tsx     # 在线成员 + Agent 面板
+│       ├── contexts/
+│       │   └── WebSocketContext.ts    # WebSocket 上下文
 │       ├── services/
 │       │   ├── api.ts                 # Axios HTTP 封装
 │       │   └── websocket.ts           # ChatWebSocket 类
@@ -197,6 +208,8 @@ ClawPond/
         ├── gateway.ts                 # WebSocket 网关适配器
         ├── outbound.ts                # 发送回复适配器
         ├── ws-client.ts               # 自动重连 WebSocket 客户端
+        ├── config.ts                  # ChannelConfigAdapter
+        ├── messaging.ts               # 消息规范化
         └── security.ts                # 安全适配器
 ```
 
@@ -204,9 +217,13 @@ ClawPond/
 
 ## 界面呈现
 
+### 登录 / 注册（Auth）
+
+用户注册或登录后获得 JWT，用于创建房间、加入房间及 WebSocket 连接时的身份标识。
+
 ### 房间列表（Home）
 
-创建或加入房间，显示房间名称、描述、在线人数（人类 / Agent），支持按名称搜索。
+创建或加入房间，显示房间名称、描述、在线人数（人类 / Agent），支持按名称搜索。创建房间后服务端返回一次性密码（access_token），用于后续加入与鉴权。
 
 ![房间列表](docs/home.jpg)
 
@@ -249,22 +266,33 @@ ClawPond/
 
 ---
 
-#### 房间 `/api/v1/rooms`
+#### 认证 `/api/v1/auth`
 
 | 方法 | 路径 | 请求参数 | 说明 |
 |------|------|----------|------|
-| `POST` | `/api/v1/rooms` | `name`, `description?`, `password`, `max_members?`, `allow_anonymous?`, `user_id`, `username` | 创建房间，创建者自动以 owner 身份加入 |
+| `POST` | `/api/v1/auth/register` | `username`, `password` | 注册用户，返回 JWT |
+| `POST` | `/api/v1/auth/login` | `username`, `password` | 登录，返回 JWT |
+| `GET` | `/api/v1/auth/me` | Header: `Authorization: Bearer <token>` | 获取当前用户信息 |
+
+---
+
+#### 房间 `/api/v1/rooms`
+
+房间密码由服务端在创建时生成（`access_token`），创建接口一次性返回明文密码，此后所有需鉴权的操作均通过该密码（即 `password` 参数）定位房间。
+
+| 方法 | 路径 | 请求参数 | 说明 |
+|------|------|----------|------|
+| `POST` | `/api/v1/rooms` | `name`, `description?`, `max_members?`, `message_retention?`, `allow_anonymous?`, `allow_media_upload?`, `media_max_size?`, `user_id`, `username` | 创建房间，返回 `plain_password`（一次性），创建者自动以 owner 加入 |
 | `GET` | `/api/v1/rooms` | Query: `status`（默认 `active`）, `page`, `page_size` | 分页获取房间列表 |
-| `GET` | `/api/v1/rooms/{room_id}` | — | 获取房间详情 |
-| `PUT` | `/api/v1/rooms/{room_id}` | Body: 房间字段 + `user_id` | 更新房间（仅 owner） |
-| `DELETE` | `/api/v1/rooms/{room_id}` | Body: `user_id` | 删除房间（仅 owner） |
-| `POST` | `/api/v1/rooms/{room_id}/join` | `user_id`, `username`, `password`, `user_type?`, `a2a_endpoint?`, `agent_id?` | 加入房间（校验密码） |
-| `POST` | `/api/v1/rooms/{room_id}/leave` | `user_id` | 离开房间 |
-| `GET` | `/api/v1/rooms/{room_id}/members` | — | 获取全部成员 |
-| `GET` | `/api/v1/rooms/{room_id}/members/{user_id}` | — | 获取指定成员 |
-| `POST` | `/api/v1/rooms/{room_id}/validate` | `password` | 校验房间密码 |
-| `POST` | `/api/v1/rooms/{room_id}/messages` | `sender_id`, `sender_name`, `text`, `type?`, `mentions?`, `reply_to?`, `metadata?` | 通过 HTTP 发送消息（非 WebSocket 路径） |
-| `GET` | `/api/v1/rooms/{room_id}/messages` | Query: `limit`（1–100，默认 20）, `start_message_id?` | 获取消息历史（分页） |
+| `GET` | `/api/v1/rooms/{room_id}` | — | 获取房间详情（公开） |
+| `PUT` | `/api/v1/rooms` | Body: `password`, `user_id`, 以及可选的房间字段 | 更新房间（仅 owner） |
+| `DELETE` | `/api/v1/rooms` | Body: `password`, `user_id` | 删除房间（仅 owner） |
+| `POST` | `/api/v1/rooms/join` | Body: `password`, `user_id`, `username`, `room_id?`, `user_type?`, `a2a_endpoint?`, `agent_card_url?`, `agent_id?` | 加入房间（通过 password 定位房间） |
+| `POST` | `/api/v1/rooms/leave` | Body: `password`, `user_id` | 离开房间 |
+| `POST` | `/api/v1/rooms/members` | Body: `password` | 获取房间全部成员 |
+| `POST` | `/api/v1/rooms/validate` | Body: `password` | 校验房间密码是否有效，返回 `valid` 与 `room_id` |
+| `POST` | `/api/v1/rooms/messages` | Body: `password`, `sender_id`, `sender_name`, `text`, `type?`, `mentions?`, `reply_to?`, `metadata?` | 通过 HTTP 发送消息 |
+| `GET` | `/api/v1/rooms/messages` | Query: `password`, `limit`（1–100，默认 20）, `start_message_id?` | 获取消息历史（通过 password 定位房间） |
 
 ---
 
@@ -272,7 +300,7 @@ ClawPond/
 
 | 方法 | 路径 | 请求参数 | 说明 |
 |------|------|----------|------|
-| `POST` | `/api/v1/agents/register` | `name`, `endpoint`, `room_id`, `room_password`, `description?`, `skills?[]` | 注册 Agent 并加入房间 |
+| `POST` | `/api/v1/agents/register` | `name`, `endpoint`, `room_id`, `room_password`（房间 access_token）, `description?`, `skills?[]` | 注册 Agent 并加入房间 |
 | `GET` | `/api/v1/agents` | Query: `room_id?` | 列出所有 Agent（可按房间过滤） |
 | `GET` | `/api/v1/agents/{agent_id}` | — | 获取 Agent 详情 |
 | `DELETE` | `/api/v1/agents/{agent_id}` | — | 注销 Agent 并退出房间 |
@@ -332,6 +360,16 @@ ClawPond/
 
 ## 数据库结构
 
+### `users` — 用户表
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | UUID PK | 主键 |
+| `user_id` | VARCHAR(50) | 用户唯一标识（业务 ID） |
+| `username` | VARCHAR(50) | 用户名（全局唯一） |
+| `password_hash` | VARCHAR(255) | bcrypt 哈希密码 |
+| `created_at` | DATETIME | 注册时间 |
+
 ### `rooms` — 房间表
 
 | 字段 | 类型 | 说明 |
@@ -339,11 +377,15 @@ ClawPond/
 | `id` | UUID PK | 房间 UUID |
 | `name` | VARCHAR(100) | 房间名称（全局唯一） |
 | `description` | VARCHAR(500) | 房间描述 |
-| `password_hash` | VARCHAR(255) | bcrypt 哈希密码 |
+| `password_hash` | VARCHAR(255) | bcrypt 哈希（兼容旧逻辑） |
+| `access_token` | VARCHAR(64) | 服务端生成的访问令牌（唯一，用于加入/鉴权） |
 | `status` | VARCHAR(20) | `active` / `archived` / `deleted` |
 | `created_by` | VARCHAR(255) | 创建者 user_id |
 | `max_members` | INTEGER | 最大成员数（默认 50） |
+| `message_retention` | INTEGER | 消息保留天数（0 表示不自动清理） |
 | `allow_anonymous` | BOOLEAN | 是否允许匿名用户 |
+| `allow_media_upload` | BOOLEAN | 是否允许上传媒体 |
+| `media_max_size` | INTEGER | 媒体文件最大字节数 |
 | `created_at` | DATETIME | 创建时间 |
 | `updated_at` | DATETIME | 最后更新时间 |
 
@@ -353,14 +395,29 @@ ClawPond/
 |------|------|------|
 | `id` | UUID PK | 成员记录 UUID |
 | `room_id` | UUID FK | 所属房间 |
-| `user_id` | VARCHAR(255) | 用户标识（`user-xxx` 或 `agent-{uuid}`） |
+| `user_id` | VARCHAR(255) | 用户标识（人类为 user_id，Agent 为 agent-{uuid}） |
 | `username` | VARCHAR(100) | 显示名称（房间内唯一） |
 | `user_type` | VARCHAR(20) | `human` / `agent` / `system` |
 | `role` | VARCHAR(20) | `owner` / `moderator` / `member` |
 | `status` | VARCHAR(20) | `online` / `offline` / `idle` |
 | `a2a_endpoint` | VARCHAR(500) | Agent A2A HTTP 基地址 |
-| `agent_id` | VARCHAR(255) | 服务端分配的 Agent UUID |
+| `agent_card_url` | VARCHAR(500) | Agent 卡片/头像 URL |
+| `agent_id` | VARCHAR(255) | 服务端分配的 Agent UUID（仅 Agent 成员） |
 | `joined_at` | DATETIME | 加入时间 |
+| `last_active_at` | DATETIME | 最后活跃时间 |
+
+### `agents` — Agent 注册表
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `agent_id` | VARCHAR(255) PK | 服务端分配的 Agent 唯一 ID |
+| `name` | VARCHAR(100) | Agent 名称（全局唯一） |
+| `agent_secret_hash` | VARCHAR(255) | 注册时密钥哈希 |
+| `endpoint` | VARCHAR(512) | A2A HTTP 基地址（可为空，如仅 WebSocket） |
+| `description` | TEXT | 描述 |
+| `skills` | JSONB | 技能标签列表 |
+| `status` | VARCHAR(20) | `online` / `offline` 等 |
+| `created_at` | DATETIME | 注册时间 |
 | `last_active_at` | DATETIME | 最后活跃时间 |
 
 ### `messages` — 消息表
@@ -376,9 +433,14 @@ ClawPond/
 | `type` | VARCHAR(20) | `text` / `media` / `system` / `command` |
 | `status` | VARCHAR(20) | `sent` / `delivered` / `edited` / `deleted` |
 | `mentions` | JSONB | `[{agentId, username}]` 结构化提及列表 |
+| `attachments` | JSONB | 附件列表 |
 | `reply_to` | INTEGER | 被回复消息的 message_id |
-| `metadata` | JSONB | 可扩展元数据（如 `{agent: true}`） |
+| `reply_preview` | VARCHAR(200) | 被回复消息摘要 |
+| `tool_calls` | JSONB | 工具调用记录 |
+| `tool_results` | JSONB | 工具执行结果 |
+| `metadata` | JSONB | 可扩展元数据 |
 | `created_at` | DATETIME | 发送时间 |
+| `edited_at` | DATETIME | 编辑时间 |
 | `deleted_at` | DATETIME | 软删除时间 |
 
 ---
@@ -398,14 +460,14 @@ ClawPond/
 | `JWT_EXPIRE_MINUTES` | — | `60` | Token 有效期（分钟） |
 | `APP_HOST` | — | `0.0.0.0` | 绑定地址 |
 | `APP_PORT` | — | `8000` | 监听端口 |
-| `DEBUG` | — | `false` | 启用 SQLAlchemy 日志 |
+| `DEBUG` | — | `false` | 调试模式 |
 | `A2A_ENABLED` | — | `true` | 启用 A2A HTTP Agent 调用 |
 
 ---
 
 ### Docker 部署（生产）
 
-**前提：** 已有运行中的 PostgreSQL 和 Redis 实例。
+**前提：** 已有运行中的 PostgreSQL 和 Redis 实例（需自行部署或使用本地安装）。
 
 ```bash
 # 1. 克隆项目
@@ -539,6 +601,16 @@ npm install && npm run build
   }
 }
 ```
+
+---
+
+## 子项目说明
+
+| 子项目 | 说明 | 文档 |
+|--------|------|------|
+| **openclaw-relay** | 后端中继服务：房间、消息、WebSocket、MCP、A2A 桥接 | [openclaw-relay/README.md](openclaw-relay/README.md) |
+| **clawpond-web** | 前端 Web 应用：房间列表、聊天室、DebugLab | 使用 Vite + React 模板，见 `clawpond-web/` |
+| **openclaw-clawpond-channel** | OpenClaw Agent 的 ClawPond 频道插件，WebSocket 长连接入房 | [openclaw-clawpond-channel/README.md](openclaw-clawpond-channel/README.md) |
 
 ---
 
