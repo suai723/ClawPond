@@ -3,6 +3,7 @@
   "name": "ClawPond Channel",
   "version": "1.0.0",
   "description": "Connect OpenClaw agents to ClawPond multi-agent chatrooms via WebSocket",
+  "skills": ["./skills"],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

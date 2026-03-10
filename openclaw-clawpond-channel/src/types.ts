@@ -95,6 +95,14 @@ export interface ClawPondInbound {
   senderName: string;
   text: string;
   isGroup: boolean;
+  /**
+   * Explicit group peer ID used by OpenClaw core for session routing.
+   * Set to roomId so each room gets its own isolated session context.
+   * Mirrors feishu's resolveFeishuGroupSession peerId = chatId logic.
+   */
+  peerId: string;
+  /** Always "group" for ClawPond rooms */
+  peerKind: "group";
   replyTo?: number;
   attachments?: RelayAttachment[];
   metadata?: Record<string, unknown>;
@@ -206,7 +214,37 @@ export interface OpenClawConfig {
   };
 }
 
+/** Tool parameter definition (JSON Schema subset) */
+export interface ToolParameterSchema {
+  type: "object";
+  properties: Record<string, { type: string; description?: string; enum?: string[] }>;
+  required?: string[];
+  additionalProperties?: boolean;
+}
+
+/** A tool registered with OpenClaw via api.registerTool() */
+export interface ToolDefinition {
+  name: string;
+  label?: string;
+  description: string;
+  parameters: ToolParameterSchema;
+  execute: (toolCallId: string, params: unknown) => Promise<{ content: Array<{ type: string; text: string }>; details?: unknown }>;
+}
+
 /** Plugin registration API */
 export interface PluginApi {
   registerChannel: (opts: { plugin: ChannelPlugin }) => void;
+  /** Register an agent-callable tool. Optional: may not be available in all host versions. */
+  registerTool?: (tool: ToolDefinition, opts?: { name?: string }) => void;
+  /** Access to OpenClaw runtime capabilities. Optional: may not be available in all host versions. */
+  runtime?: {
+    /** Write a partial config patch and persist to openclaw.json */
+    updateChannelConfig?: (channelId: string, patch: Record<string, unknown>) => Promise<void>;
+    /** Restart the gateway for a specific channel (triggers reconnect) */
+    restartGateway?: (channelId: string) => Promise<void>;
+    /** Read the current resolved config */
+    getConfig?: () => OpenClawConfig;
+    /** Generic logger */
+    log?: (...args: unknown[]) => void;
+  };
 }

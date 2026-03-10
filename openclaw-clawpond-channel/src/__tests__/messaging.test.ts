@@ -154,6 +154,32 @@ describe("handleInboundMessage", () => {
     });
   });
 
+  describe("session isolation fields (peerId / peerKind)", () => {
+    it("sets peerId equal to the roomId parameter for group session isolation", () => {
+      const deps = makeDeps();
+      handleInboundMessage(baseData, "room-abc", "default", deps);
+      expect(deps.emitMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ peerId: "room-abc" })
+      );
+    });
+
+    it("peerId mirrors a different roomId when called with a different room", () => {
+      const deps = makeDeps();
+      handleInboundMessage(baseData, "room-xyz", "default", deps);
+      expect(deps.emitMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ peerId: "room-xyz" })
+      );
+    });
+
+    it("sets peerKind to 'group'", () => {
+      const deps = makeDeps();
+      handleInboundMessage(baseData, "room-abc", "default", deps);
+      expect(deps.emitMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ peerKind: "group" })
+      );
+    });
+  });
+
   describe("emitMessage invocation", () => {
     it("calls deps.emitMessage exactly once", () => {
       const deps = makeDeps();

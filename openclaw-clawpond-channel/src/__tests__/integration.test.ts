@@ -167,6 +167,9 @@ describe("Full plugin pipeline integration", () => {
     expect(msg.messageId).toBe(100);
     expect(msg.text).toBe("@IntegBot please help");
     expect(msg.isGroup).toBe(true);
+    // Session isolation: each room is its own group peer
+    expect(msg.peerId).toBe(ROOM_ID);
+    expect(msg.peerKind).toBe("group");
 
     await stop();
   });
@@ -233,6 +236,9 @@ describe("Full plugin pipeline integration", () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(capturedInbound).not.toBeNull();
+    // Verify session isolation fields in the round-trip inbound message
+    expect(capturedInbound!.peerId).toBe(ROOM_ID);
+    expect(capturedInbound!.peerKind).toBe("group");
 
     const replyContext: ReplyContext = {
       roomId: capturedInbound!.roomId,

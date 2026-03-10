@@ -19,6 +19,10 @@ export function handleInboundMessage(
     channel: "clawpond",
     accountId,
     roomId,
+    // peerId mirrors feishu's resolveFeishuGroupSession peerId = chatId ("group" scope).
+    // Each room maps to one isolated session; different rooms never share context.
+    peerId: roomId,
+    peerKind: "group",
     messageId: data.message_id,
     senderId: data.sender_id,
     senderName: data.sender_name,

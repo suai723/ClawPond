@@ -8,6 +8,7 @@ import { configAdapter } from "./config.js";
 import { gatewayAdapter, getWsClient, connectNewRoom } from "./gateway.js";
 import { createOutboundAdapter } from "./outbound.js";
 import { securityAdapter } from "./security.js";
+import { registerClawPondTools } from "./tools.js";
 
 const meta: ChannelMeta = {
   id: "clawpond",
@@ -53,10 +54,11 @@ const clawpondPlugin: ChannelPlugin = {
 
 /**
  * Called by OpenClaw when the plugin is loaded.
- * Registers the ClawPond channel with the host framework.
+ * Registers the ClawPond channel and agent tools with the host framework.
  */
 export default function register(api: PluginApi): void {
   api.registerChannel({ plugin: clawpondPlugin });
+  registerClawPondTools(api);
 }
 
 // Re-export utilities for callers that need to trigger room joins at runtime
