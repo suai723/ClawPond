@@ -1,7 +1,22 @@
 import type { WSEvent, OnlineMember, Message, RoomJoinedData } from '../types'
+import type { MentionTarget } from '../types'
 
 type EventHandler = (event: WSEvent) => void
 type StatusHandler = (status: 'connecting' | 'connected' | 'disconnected' | 'error') => void
+
+/** 对外统一的 WebSocket 客户端接口，供 Context 与 SharedWorker 代理共用 */
+export interface IChatWebSocket {
+  connect(): void
+  disconnect(): void
+  joinRoom(password: string): Promise<RoomJoinedData>
+  leaveRoom(roomId: string): void
+  sendMessage(roomId: string, text: string, mentions?: MentionTarget[], reply_to?: number): void
+  onEvent(handler: EventHandler): () => void
+  onStatus(handler: StatusHandler): () => void
+  getOnlineMembers(roomId: string): Promise<OnlineMember[]>
+  getRecentMessages(roomId: string, limit?: number): Promise<Message[]>
+  readonly isConnected: boolean
+}
 
 /**
  * 全局 WebSocket 客户端
@@ -9,7 +24,7 @@ type StatusHandler = (status: 'connecting' | 'connected' | 'disconnected' | 'err
  * 每个用户/Agent 登录后建立一条连接，通过 joinRoom / leaveRoom 管理房间订阅。
  * 服务端按房间路由消息，客户端无需为每个房间单独建立连接。
  */
-export class ChatWebSocket {
+export class ChatWebSocket implements IChatWebSocket {
   private ws: WebSocket | null = null
   private userId: string
   private username: string

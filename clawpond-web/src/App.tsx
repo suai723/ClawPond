@@ -4,7 +4,22 @@ import Home from './pages/Home'
 import ChatRoom from './pages/ChatRoom'
 import DebugLab from './pages/DebugLab'
 import { ChatWebSocket } from './services/websocket'
+import { SharedWorkerChatSocket } from './services/websocket-shared'
+import type { IChatWebSocket } from './services/websocket'
 import { WebSocketContext } from './contexts/WebSocketContext'
+
+function createMainWebSocket(): IChatWebSocket {
+  if (typeof SharedWorker !== 'undefined') {
+    const ws = new SharedWorkerChatSocket()
+    ws.connect()
+    return ws
+  }
+  const uid = localStorage.getItem('cp_user_id') ?? ''
+  const uname = localStorage.getItem('cp_username') ?? ''
+  const ws = new ChatWebSocket(uid, uname, 'human')
+  ws.connect()
+  return ws
+}
 
 type View = 'auth' | 'home' | 'chat' | 'debug'
 
@@ -26,14 +41,13 @@ export default function App() {
   const [userId, setUserId] = useState(() => localStorage.getItem('cp_user_id') ?? '')
   const [username, setUsername] = useState(() => localStorage.getItem('cp_username') ?? '')
 
-  /** 全局 WebSocket 实例，登录后创建，登出时销毁 */
-  const wsRef = useRef<ChatWebSocket | null>(null)
-  const [globalWs, setGlobalWs] = useState<ChatWebSocket | null>(null)
+  /** 全局 WebSocket 实例（SharedWorker 或直连），登录后创建，登出时销毁 */
+  const wsRef = useRef<IChatWebSocket | null>(null)
+  const [globalWs, setGlobalWs] = useState<IChatWebSocket | null>(null)
 
   /**
    * 页面刷新时若用户已登录，在 useEffect 里创建 WS 连接。
-   * 使用 useEffect 而非 useState 初始化器，避免 React StrictMode 双调用
-   * 导致两个 WS 实例并存、互相踢出形成无限重连循环。
+   * 优先使用 SharedWorker 单连接，不支持时回退为每标签一直连。
    */
   useEffect(() => {
     const uid = localStorage.getItem('cp_user_id') ?? ''
@@ -41,8 +55,7 @@ export default function App() {
     const token = localStorage.getItem('cp_token')
     if (!uid || !uname || !token) return
 
-    const ws = new ChatWebSocket(uid, uname, 'human')
-    ws.connect()
+    const ws = createMainWebSocket()
     wsRef.current = ws
     setGlobalWs(ws)
 
@@ -60,8 +73,7 @@ export default function App() {
 
     wsRef.current?.disconnect()
 
-    const ws = new ChatWebSocket(uid, uname, 'human')
-    ws.connect()
+    const ws = createMainWebSocket()
     wsRef.current = ws
     setGlobalWs(ws)
 

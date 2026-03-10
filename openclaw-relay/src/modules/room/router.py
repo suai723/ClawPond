@@ -8,18 +8,26 @@ from ...schemas.room import (
     RoomCreateResponse, RoomJoinRequest, RoomLeaveRequest, RoomMemberResponse,
     RoomPasswordRequest, RoomUpdateRequest, RoomMembersRequest,
 )
+from ...schemas.message import MessageCreate, MessageFilter
 from .service import RoomService
 
 router = APIRouter()
 
 # 默认实例，可由 main.py 通过 setup_room_router 替换
 room_service = RoomService()
+message_service = None
 
 
 def setup_room_router(service: RoomService):
     """注入共享的 RoomService 实例"""
     global room_service
     room_service = service
+
+
+def setup_room_message_service(svc):
+    """注入共享的 MessageService 实例（避免循环依赖）"""
+    global message_service
+    message_service = svc
 
 
 def _room_response(room) -> RoomResponse:
@@ -100,6 +108,65 @@ async def list_rooms(
         )
     except Exception:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
+
+
+@router.get("/messages")
+async def get_messages_endpoint(
+    password: str = Query(..., description="房间 access_token"),
+    limit: int = Query(default=20, ge=1, le=100),
+    start_message_id: Optional[int] = Query(default=None),
+):
+    """获取房间消息历史 — 通过 password（access_token）定位房间"""
+    if message_service is None:
+        raise HTTPException(status_code=500, detail="Message service not initialized")
+    room = await room_service.get_room_by_password(password)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found or invalid password")
+    try:
+        messages = await message_service.get_messages(
+            MessageFilter(
+                room_id=room.id,
+                limit=limit,
+                start_message_id=start_message_id,
+            )
+        )
+        return {
+            "messages": [msg.to_dict() for msg in messages],
+            "total": len(messages),
+            "room_id": str(room.id),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/messages", status_code=201)
+async def create_message_endpoint(body: dict):
+    """通过 HTTP 发送消息 — body 需包含 password（access_token）"""
+    if message_service is None:
+        raise HTTPException(status_code=500, detail="Message service not initialized")
+    password = body.get("password", "")
+    if not password:
+        raise HTTPException(status_code=400, detail="Room password required")
+    room = await room_service.get_room_by_password(password)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found or invalid password")
+    try:
+        data = MessageCreate(
+            room_id=room.id,
+            sender_id=body.get("sender_id", ""),
+            sender_name=body.get("sender_name", ""),
+            text=body.get("text", ""),
+            type=body.get("type", "text"),
+            mentions=body.get("mentions", []),
+            reply_to=body.get("reply_to"),
+            metadata=body.get("metadata"),
+        )
+        message = await message_service.send_message(data)
+        return message.to_dict()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/{room_id}", response_model=RoomResponse)

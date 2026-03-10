@@ -113,9 +113,16 @@ export async function getRoomMembers(password: string) {
  * 获取房间消息历史 — 通过 password（access_token）定位房间。
  */
 export async function getMessages(password: string, limit = 50, start_message_id?: number) {
+  const params: { password: string; limit: number; start_message_id?: number } = {
+    password,
+    limit,
+  }
+  if (start_message_id != null) {
+    params.start_message_id = start_message_id
+  }
   const res = await api.get<{ messages: Message[]; total: number; room_id: string }>(
     `/api/v1/rooms/messages`,
-    { params: { password, limit, start_message_id } },
+    { params },
   )
   return res.data
 }

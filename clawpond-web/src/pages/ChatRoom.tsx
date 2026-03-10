@@ -17,7 +17,7 @@ interface ChatRoomProps {
 
 type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'error'
 
-export default function ChatRoom({ roomId, roomPassword, userId, username, onLeave }: ChatRoomProps) {
+export default function ChatRoom({ roomId, roomPassword, userId, username: _username, onLeave }: ChatRoomProps) {
   const [messages, setMessages] = useState<Message[]>([])
   const [onlineMembers, setOnlineMembers] = useState<OnlineMember[]>([])
   const [room, setRoom] = useState<Room | null>(null)

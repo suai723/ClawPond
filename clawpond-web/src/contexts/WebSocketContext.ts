@@ -1,8 +1,8 @@
 import { createContext, useContext } from 'react'
-import type { ChatWebSocket } from '../services/websocket'
+import type { IChatWebSocket } from '../services/websocket'
 
-export const WebSocketContext = createContext<ChatWebSocket | null>(null)
+export const WebSocketContext = createContext<IChatWebSocket | null>(null)
 
-export function useWebSocket(): ChatWebSocket | null {
+export function useWebSocket(): IChatWebSocket | null {
   return useContext(WebSocketContext)
 }

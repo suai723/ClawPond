@@ -10,11 +10,10 @@ from .modules.room.service import RoomService
 from .modules.message.service import MessageService
 from .modules.websocket.manager import WebSocketManager
 from .modules.agent.registry import AgentRegistry
-from .modules.room.router import router as room_router, setup_room_router
+from .modules.room.router import router as room_router, setup_room_router, setup_room_message_service
 from .modules.agent.router import router as agent_router, setup_agent_router
 from .modules.auth.router import router as auth_router
 from .modules.mcp.server import setup_mcp_server, setup_message_service
-from .schemas.message import MessageCreate, MessageFilter
 
 # 创建服务实例
 room_service = RoomService()
@@ -34,6 +33,7 @@ async def lifespan(app: FastAPI):
     logger.info("database_connected")
 
     setup_room_router(room_service)
+    setup_room_message_service(message_service)
     message_service.set_agent_registry(agent_registry)
     message_service.set_broadcast_callback(ws_manager.broadcast_to_room)
     message_service.set_ws_connected_check(ws_manager.is_connected)
@@ -199,71 +199,6 @@ async def websocket_endpoint(
         except Exception as e:
             logger.error("disconnect_error", error=str(e))
 
-
-@app.post("/api/v1/rooms/messages", status_code=201)
-async def create_message_endpoint(body: dict):
-    """通过 HTTP 发送消息 — body 需包含 password（access_token）"""
-    password = body.get("password", "")
-    if not password:
-        raise HTTPException(status_code=400, detail="Room password required")
-
-    room = await room_service.get_room_by_password(password)
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found or invalid password")
-
-    try:
-        data = MessageCreate(
-            room_id=room.id,
-            sender_id=body.get("sender_id", ""),
-            sender_name=body.get("sender_name", ""),
-            text=body.get("text", ""),
-            type=body.get("type", "text"),
-            mentions=body.get("mentions", []),
-            reply_to=body.get("reply_to"),
-            metadata=body.get("metadata"),
-        )
-        message = await message_service.send_message(data)
-
-        await ws_manager.broadcast_to_room(
-            room.id,
-            {"event": "message", "data": message.to_dict()},
-        )
-
-        return message.to_dict()
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error("create_message_http_error", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/v1/rooms/messages")
-async def get_messages_endpoint(
-    password: str = Query(..., description="房间 access_token"),
-    limit: int = Query(default=20, ge=1, le=100),
-    start_message_id: int = Query(default=None),
-):
-    """获取房间消息历史 — 通过 password（access_token）定位房间"""
-    room = await room_service.get_room_by_password(password)
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found or invalid password")
-
-    try:
-        messages = await message_service.get_messages(
-            MessageFilter(
-                room_id=room.id,
-                limit=limit,
-                start_message_id=start_message_id,
-            )
-        )
-        return {
-            "messages": [msg.to_dict() for msg in messages],
-            "total": len(messages),
-            "room_id": str(room.id),
-        }
-    except Exception as e:
-        logger.error("get_messages_http_error", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
