@@ -16,14 +16,15 @@ export const configAdapter: ChannelConfigAdapter = {
     const raw = accounts[id];
     if (!raw) return undefined;
 
-    if (!raw.relayUrl || !raw.relayWsUrl || !raw.agentName) {
+    if (!raw.relayWsUrl || !raw.agentId || !raw.agentSecret || !raw.agentName) {
       return undefined;
     }
 
     return {
       accountId: id,
-      relayUrl: raw.relayUrl,
       relayWsUrl: raw.relayWsUrl,
+      agentId: raw.agentId,
+      agentSecret: raw.agentSecret,
       agentName: raw.agentName,
       agentDescription: raw.agentDescription ?? "OpenClaw Agent",
       reconnectInterval: raw.reconnectInterval ?? 1000,

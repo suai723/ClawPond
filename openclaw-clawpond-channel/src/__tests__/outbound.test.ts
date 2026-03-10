@@ -7,8 +7,9 @@ import { ClawPondAccount, GatewayDeps, OutboundContext, ReplyContext } from "../
 function makeAccount(): ClawPondAccount {
   return {
     accountId: "default",
-    relayUrl: "http://localhost:8000",
     relayWsUrl: "ws://localhost:8000",
+    agentId: "test-agent-uuid",
+    agentSecret: "test-secret",
     agentName: "Bot",
     agentDescription: "Test",
     reconnectInterval: 1000,

@@ -10,8 +10,8 @@ const makeConfig = (accounts: Record<string, unknown> = {}): OpenClawConfig => (
 describe("configAdapter.listAccountIds", () => {
   it("returns all account keys from the config", () => {
     const config = makeConfig({
-      default: { relayUrl: "http://a", relayWsUrl: "ws://a", agentName: "Bot" },
-      secondary: { relayUrl: "http://b", relayWsUrl: "ws://b", agentName: "Bot2" },
+      default: { relayWsUrl: "ws://a", agentId: "id-a", agentSecret: "sec-a", agentName: "BotA" },
+      secondary: { relayWsUrl: "ws://b", agentId: "id-b", agentSecret: "sec-b", agentName: "BotB" },
     });
     expect(configAdapter.listAccountIds(config)).toEqual(["default", "secondary"]);
   });
@@ -31,8 +31,9 @@ describe("configAdapter.listAccountIds", () => {
 
 describe("configAdapter.resolveAccount", () => {
   const validRaw = {
-    relayUrl: "http://localhost:8000",
     relayWsUrl: "ws://localhost:8000",
+    agentId: "test-agent-uuid",
+    agentSecret: "test-secret",
     agentName: "TestBot",
   };
 
@@ -41,8 +42,9 @@ describe("configAdapter.resolveAccount", () => {
     const account = configAdapter.resolveAccount(config, "default");
     expect(account).toEqual({
       accountId: "default",
-      relayUrl: "http://localhost:8000",
       relayWsUrl: "ws://localhost:8000",
+      agentId: "test-agent-uuid",
+      agentSecret: "test-secret",
       agentName: "TestBot",
       agentDescription: "OpenClaw Agent",
       reconnectInterval: 1000,
@@ -52,16 +54,15 @@ describe("configAdapter.resolveAccount", () => {
 
   it("defaults accountId to 'default' when not provided", () => {
     const config = makeConfig({ default: validRaw });
-    const account = configAdapter.resolveAccount(config, undefined);
-    expect(account?.accountId).toBe("default");
+    expect(configAdapter.resolveAccount(config, undefined)?.accountId).toBe("default");
   });
 
-  it("injects default reconnectInterval when not specified", () => {
+  it("injects default reconnectInterval", () => {
     const config = makeConfig({ default: validRaw });
     expect(configAdapter.resolveAccount(config, "default")?.reconnectInterval).toBe(1000);
   });
 
-  it("injects default maxReconnectDelay when not specified", () => {
+  it("injects default maxReconnectDelay", () => {
     const config = makeConfig({ default: validRaw });
     expect(configAdapter.resolveAccount(config, "default")?.maxReconnectDelay).toBe(30_000);
   });
@@ -75,7 +76,7 @@ describe("configAdapter.resolveAccount", () => {
     expect(account?.maxReconnectDelay).toBe(5000);
   });
 
-  it("injects default agentDescription when not specified", () => {
+  it("injects default agentDescription", () => {
     const config = makeConfig({ default: validRaw });
     expect(configAdapter.resolveAccount(config, "default")?.agentDescription).toBe("OpenClaw Agent");
   });
@@ -85,23 +86,32 @@ describe("configAdapter.resolveAccount", () => {
     expect(configAdapter.resolveAccount(config, "default")?.agentDescription).toBe("My custom bot");
   });
 
-  it("returns undefined when relayUrl is missing", () => {
+  // ── required field validation ─────────────────────────────────────────────
+
+  it("returns undefined when relayWsUrl is missing", () => {
     const config = makeConfig({
-      default: { relayWsUrl: "ws://localhost:8000", agentName: "Bot" },
+      default: { agentId: "id", agentSecret: "sec", agentName: "Bot" },
     });
     expect(configAdapter.resolveAccount(config, "default")).toBeUndefined();
   });
 
-  it("returns undefined when relayWsUrl is missing", () => {
+  it("returns undefined when agentId is missing", () => {
     const config = makeConfig({
-      default: { relayUrl: "http://localhost:8000", agentName: "Bot" },
+      default: { relayWsUrl: "ws://localhost:8000", agentSecret: "sec", agentName: "Bot" },
+    });
+    expect(configAdapter.resolveAccount(config, "default")).toBeUndefined();
+  });
+
+  it("returns undefined when agentSecret is missing", () => {
+    const config = makeConfig({
+      default: { relayWsUrl: "ws://localhost:8000", agentId: "id", agentName: "Bot" },
     });
     expect(configAdapter.resolveAccount(config, "default")).toBeUndefined();
   });
 
   it("returns undefined when agentName is missing", () => {
     const config = makeConfig({
-      default: { relayUrl: "http://localhost:8000", relayWsUrl: "ws://localhost:8000" },
+      default: { relayWsUrl: "ws://localhost:8000", agentId: "id", agentSecret: "sec" },
     });
     expect(configAdapter.resolveAccount(config, "default")).toBeUndefined();
   });

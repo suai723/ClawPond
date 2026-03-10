@@ -12,17 +12,21 @@
         "additionalProperties": {
           "type": "object",
           "properties": {
-            "relayUrl": {
-              "type": "string",
-              "description": "ClawPond Relay HTTP URL (e.g. http://localhost:8000)"
-            },
             "relayWsUrl": {
               "type": "string",
               "description": "ClawPond Relay WebSocket URL (e.g. ws://localhost:8000)"
             },
+            "agentId": {
+              "type": "string",
+              "description": "Agent UUID returned by POST /api/v1/agents/register"
+            },
+            "agentSecret": {
+              "type": "string",
+              "description": "Agent secret returned by POST /api/v1/agents/register (shown only once)"
+            },
             "agentName": {
               "type": "string",
-              "description": "Agent display name shown in UI and @mentions. Only needs to be unique within each room (not globally)."
+              "description": "Agent display name (must match the name used during registration)"
             },
             "agentDescription": {
               "type": "string",
@@ -37,23 +41,28 @@
               "description": "Maximum reconnect delay in ms (default: 30000)"
             }
           },
-          "required": ["relayUrl", "relayWsUrl", "agentName"]
+          "required": ["relayWsUrl", "agentId", "agentSecret", "agentName"]
         }
       }
     }
   },
   "uiHints": {
-    "accounts.*.relayUrl": {
-      "label": "Relay HTTP URL",
-      "placeholder": "http://localhost:8000"
-    },
     "accounts.*.relayWsUrl": {
       "label": "Relay WebSocket URL",
       "placeholder": "ws://localhost:8000"
     },
+    "accounts.*.agentId": {
+      "label": "Agent ID",
+      "description": "UUID returned when you registered the agent via POST /api/v1/agents/register"
+    },
+    "accounts.*.agentSecret": {
+      "label": "Agent Secret",
+      "description": "Secret returned at registration time. Store it securely — it is shown only once.",
+      "sensitive": true
+    },
     "accounts.*.agentName": {
       "label": "Agent Name",
-      "description": "Display name for @mentions. Only needs to be unique within each room. The relay assigns a global UUID automatically."
+      "description": "Must match the name used during registration"
     },
     "accounts.*.agentDescription": {
       "label": "Agent Description"

@@ -2,20 +2,28 @@
  * integration.test.ts
  *
  * End-to-end integration test covering the full pipeline:
- *   Mock HTTP (GET /api/v1/agents)
- *     → gatewayAdapter.start()
- *     → ClawPondWsClient.connectRoom()
+ *   gatewayAdapter.start()
+ *     → single WS connection with agent_id + agent_secret
+ *     → connectNewRoom() sends joinRoom WS message
  *     → Mock WS Server broadcasts @mention message
  *     → handleInboundMessage → deps.emitMessage (OpenClaw)
- *     → outbound.sendText() → Mock WS Server receives the reply
+ *     → outbound.sendText() → Mock WS Server receives reply with room_id
  */
 
 import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
-import { gatewayAdapter, getWsClient } from "../gateway";
+import { gatewayAdapter, connectNewRoom, getWsClient } from "../gateway";
 import { createOutboundAdapter } from "../outbound";
-import { ClawPondAccount, GatewayDeps, OutboundContext, ReplyContext, RelayBroadcast, RelayMessageData, ClawPondInbound } from "../types";
+import {
+  ClawPondAccount,
+  GatewayDeps,
+  OutboundContext,
+  ReplyContext,
+  RelayBroadcast,
+  RelayMessageData,
+  ClawPondInbound,
+} from "../types";
 
-// ── test helpers ─────────────────────────────────────────────────────────────
+// ── helpers ──────────────────────────────────────────────────────────────────
 
 async function startServer(): Promise<{ wss: WebSocketServer; port: number }> {
   return new Promise((resolve, reject) => {
@@ -31,11 +39,12 @@ async function startServer(): Promise<{ wss: WebSocketServer; port: number }> {
 function makeAccount(port: number): ClawPondAccount {
   return {
     accountId: "integration",
-    relayUrl: "http://relay-integration.local",
     relayWsUrl: `ws://localhost:${port}`,
+    agentId: "integ-agent-uuid",
+    agentSecret: "integ-secret",
     agentName: "IntegBot",
     agentDescription: "Integration test agent",
-    reconnectInterval: 5000,   // avoid reconnect noise
+    reconnectInterval: 5000,
     maxReconnectDelay: 30_000,
   };
 }
@@ -56,19 +65,9 @@ function makeDeps(emitHandler?: (inbound: ClawPondInbound) => void): GatewayDeps
 
 const AGENT_ID = "integ-agent-uuid";
 const ROOM_ID = "integ-room-001";
+const ROOM_PASSWORD = "integ-room-password";
 
-function mockAgentsResponse(agentName: string): void {
-  jest.spyOn(global, "fetch").mockResolvedValue(
-    new Response(
-      JSON.stringify({
-        agents: [{ agent_id: AGENT_ID, name: agentName, room_id: ROOM_ID }],
-      }),
-      { status: 200 }
-    )
-  );
-}
-
-function makeInboundBroadcast(agentId: string, senderId = "user-human-1"): string {
+function makeMentionBroadcast(agentId: string, senderId = "user-human-1"): string {
   const data: RelayMessageData = {
     id: "integ-msg-1",
     message_id: 100,
@@ -89,50 +88,75 @@ function makeInboundBroadcast(agentId: string, senderId = "user-human-1"): strin
 describe("Full plugin pipeline integration", () => {
   let wss: WebSocketServer;
   let port: number;
-  let fetchSpy: jest.SpyInstance;
 
   beforeEach(async () => {
     const srv = await startServer();
     wss = srv.wss;
     port = srv.port;
-    mockAgentsResponse("IntegBot");
-    fetchSpy = jest.spyOn(global, "fetch");
   });
 
   afterEach(async () => {
-    fetchSpy.mockRestore();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
-  it("starts gateway, connects to the room, and sets WsClient", async () => {
+  it("WS handshake carries agent_id and agent_secret query params", async () => {
     const account = makeAccount(port);
     const deps = makeDeps();
+
+    let receivedUrl = "";
+    wss.once("connection", (_sock, req) => { receivedUrl = req.url ?? ""; });
 
     const { stop } = await gatewayAdapter.start(account, deps);
     await new Promise((r) => setTimeout(r, 100));
 
-    expect(getWsClient()).not.toBeNull();
+    expect(receivedUrl).toContain(`agent_id=${AGENT_ID}`);
+    expect(receivedUrl).toContain("agent_secret=integ-secret");
+    expect(receivedUrl).toContain("user_type=agent");
+
     await stop();
     expect(getWsClient()).toBeNull();
   });
 
+  it("connectNewRoom sends joinRoom WS message with correct password", async () => {
+    const account = makeAccount(port);
+    const deps = makeDeps();
+
+    const { stop } = await gatewayAdapter.start(account, deps);
+
+    const serverSocket = await new Promise<WsWebSocket>((resolve) =>
+      wss.once("connection", (s) => resolve(s))
+    );
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    const joinMsg = await new Promise<string>((resolve) => {
+      serverSocket.once("message", (data) => resolve(data.toString()));
+      connectNewRoom({ roomId: ROOM_ID, roomPassword: ROOM_PASSWORD });
+    });
+
+    const parsed = JSON.parse(joinMsg);
+    expect(parsed.method).toBe("joinRoom");
+    expect(parsed.params.password).toBe(ROOM_PASSWORD);
+
+    await stop();
+  });
+
   it("receives @mention → emits inbound message to OpenClaw", async () => {
     const account = makeAccount(port);
-
     const emittedMessages: ClawPondInbound[] = [];
     const deps = makeDeps((inbound) => emittedMessages.push(inbound));
 
     const { stop } = await gatewayAdapter.start(account, deps);
 
-    // Wait for WS connection to be established
     const serverSocket = await new Promise<WsWebSocket>((resolve) =>
       wss.once("connection", (s) => resolve(s))
     );
-    // Wait for onReady
     await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
 
-    // Server broadcasts a @mention
-    serverSocket.send(makeInboundBroadcast(AGENT_ID));
+    connectNewRoom({ roomId: ROOM_ID, roomPassword: ROOM_PASSWORD });
+    // consume the joinRoom message
+    await new Promise((r) => setTimeout(r, 50));
+
+    serverSocket.send(makeMentionBroadcast(AGENT_ID));
     await new Promise((r) => setTimeout(r, 100));
 
     expect(emittedMessages).toHaveLength(1);
@@ -147,7 +171,7 @@ describe("Full plugin pipeline integration", () => {
     await stop();
   });
 
-  it("outbound sends a reply back through the WS connection", async () => {
+  it("outbound sendText sends payload with room_id to the server", async () => {
     const account = makeAccount(port);
     const deps = makeDeps();
 
@@ -158,7 +182,9 @@ describe("Full plugin pipeline integration", () => {
     );
     await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
 
-    // Create outbound adapter backed by the live WsClient
+    connectNewRoom({ roomId: ROOM_ID, roomPassword: ROOM_PASSWORD });
+    await new Promise((r) => setTimeout(r, 50));
+
     const outbound = createOutboundAdapter(() => getWsClient());
 
     const replyContext: ReplyContext = {
@@ -173,7 +199,6 @@ describe("Full plugin pipeline integration", () => {
       account,
     };
 
-    // Capture what the server receives
     const serverReceived = await new Promise<string>((resolve) => {
       serverSocket.once("message", (data) => resolve(data.toString()));
       outbound.sendText(ctx);
@@ -181,15 +206,15 @@ describe("Full plugin pipeline integration", () => {
 
     const parsed = JSON.parse(serverReceived);
     expect(parsed.method).toBe("sendMessage");
+    expect(parsed.params.room_id).toBe(ROOM_ID);
     expect(parsed.params.text).toBe("I can help!");
     expect(parsed.params.reply_to).toBe(100);
 
     await stop();
   });
 
-  it("full round-trip: receive @mention → emit to OpenClaw → reply via outbound", async () => {
+  it("full round-trip: receive @mention → emit → reply via outbound", async () => {
     const account = makeAccount(port);
-
     let capturedInbound: ClawPondInbound | null = null;
     const deps = makeDeps((inbound) => { capturedInbound = inbound; });
 
@@ -201,13 +226,14 @@ describe("Full plugin pipeline integration", () => {
     );
     await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
 
-    // Step 1: server sends @mention
-    serverSocket.send(makeInboundBroadcast(AGENT_ID));
+    connectNewRoom({ roomId: ROOM_ID, roomPassword: ROOM_PASSWORD });
+    await new Promise((r) => setTimeout(r, 50));
+
+    serverSocket.send(makeMentionBroadcast(AGENT_ID));
     await new Promise((r) => setTimeout(r, 100));
 
     expect(capturedInbound).not.toBeNull();
 
-    // Step 2: OpenClaw "processes" the message and calls outbound.sendText
     const replyContext: ReplyContext = {
       roomId: capturedInbound!.roomId,
       messageId: capturedInbound!.messageId,
@@ -225,6 +251,7 @@ describe("Full plugin pipeline integration", () => {
     });
 
     const parsed = JSON.parse(serverReceived);
+    expect(parsed.params.room_id).toBe(ROOM_ID);
     expect(parsed.params.text).toBe("Round-trip reply");
     expect(parsed.params.reply_to).toBe(100);
 
@@ -233,7 +260,6 @@ describe("Full plugin pipeline integration", () => {
 
   it("ignores messages not mentioning the agent", async () => {
     const account = makeAccount(port);
-
     const emittedMessages: ClawPondInbound[] = [];
     const deps = makeDeps((inbound) => emittedMessages.push(inbound));
 
@@ -244,7 +270,9 @@ describe("Full plugin pipeline integration", () => {
     );
     await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
 
-    // Broadcast a message mentioning a different agent
+    connectNewRoom({ roomId: ROOM_ID, roomPassword: ROOM_PASSWORD });
+    await new Promise((r) => setTimeout(r, 50));
+
     const data: RelayMessageData = {
       id: "msg-other",
       message_id: 200,

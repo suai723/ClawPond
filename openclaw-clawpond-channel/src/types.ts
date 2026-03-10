@@ -6,13 +6,15 @@
 export interface ClawPondAccount {
   /** Account identifier (key in openclaw.json) */
   accountId: string;
-  /** ClawPond Relay HTTP base URL, e.g. "http://localhost:8000" */
-  relayUrl: string;
   /** ClawPond Relay WebSocket base URL, e.g. "ws://localhost:8000" */
   relayWsUrl: string;
-  /** Agent display name shown in UI and @mentions (room-scoped, not globally unique) */
+  /** Agent UUID returned by POST /api/v1/agents/register */
+  agentId: string;
+  /** Agent secret returned by POST /api/v1/agents/register (stored sensitive) */
+  agentSecret: string;
+  /** Agent display name used for @mention legacy string matching */
   agentName: string;
-  /** Human-readable description sent during registration */
+  /** Human-readable description */
   agentDescription: string;
   /** Initial reconnect delay in ms (default: 1000) */
   reconnectInterval: number;
@@ -20,13 +22,11 @@ export interface ClawPondAccount {
   maxReconnectDelay: number;
 }
 
-/** A room that the plugin has successfully joined */
+/** A room subscription passed to connectNewRoom() after HTTP join */
 export interface JoinedRoom {
   roomId: string;
-  /** 服务端分发的 agent UUID */
-  agentId: string;
-  /** WebSocket 连接使用的 user_id（格式: "agent-{agentId}"） */
-  userId: string;
+  /** Room access_token (password) used in WS joinRoom message */
+  roomPassword: string;
 }
 
 /** Raw broadcast payload from the relay WebSocket */
@@ -81,7 +81,6 @@ export interface RelayConnectedData {
   user_id: string;
   username: string;
   online_members: RelayMemberData[];
-  /** 服务端分发的 agent UUID（仅 agent 连接时有值，供自我识别） */
   agent_id?: string;
 }
 

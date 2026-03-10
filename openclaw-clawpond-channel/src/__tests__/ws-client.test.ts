@@ -1,17 +1,26 @@
+/**
+ * ws-client.test.ts
+ *
+ * Tests for the single-connection ClawPondWsClient.
+ * Uses a real WebSocketServer to verify connection, joinRoom, sendMessage,
+ * @mention detection, reconnection, and error handling.
+ */
+
 import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
 import { ClawPondWsClient } from "../ws-client";
-import { ClawPondAccount, GatewayDeps, JoinedRoom, RelayBroadcast, RelayMessageData } from "../types";
+import { ClawPondAccount, GatewayDeps, RelayBroadcast, RelayMessageData } from "../types";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 function makeAccount(overrides: Partial<ClawPondAccount> = {}): ClawPondAccount {
   return {
     accountId: "default",
-    relayUrl: "http://localhost",
     relayWsUrl: "ws://localhost",
+    agentId: "test-agent-uuid",
+    agentSecret: "test-secret",
     agentName: "TestBot",
     agentDescription: "Test",
-    reconnectInterval: 50,   // short delays for fast tests
+    reconnectInterval: 50,
     maxReconnectDelay: 200,
     ...overrides,
   };
@@ -33,21 +42,6 @@ function makeDeps(): GatewayDeps & {
   };
 }
 
-function makeRoom(overrides: Partial<JoinedRoom> = {}): JoinedRoom {
-  return {
-    roomId: "room-001",
-    agentId: "agent-uuid-1",
-    userId: "agent-agent-uuid-1",
-    ...overrides,
-  };
-}
-
-/** Wait for a WS server to receive the next connection */
-function waitForConnection(wss: WebSocketServer): Promise<WsWebSocket> {
-  return new Promise((resolve) => wss.once("connection", (socket) => resolve(socket)));
-}
-
-/** Start a local WS server on an OS-assigned port and return it with the port */
 async function startServer(): Promise<{ wss: WebSocketServer; port: number }> {
   return new Promise((resolve, reject) => {
     const wss = new WebSocketServer({ port: 0 });
@@ -59,14 +53,19 @@ async function startServer(): Promise<{ wss: WebSocketServer; port: number }> {
   });
 }
 
-function makeMessageBroadcast(
+function waitForConnection(wss: WebSocketServer): Promise<WsWebSocket> {
+  return new Promise((resolve) => wss.once("connection", (socket) => resolve(socket)));
+}
+
+function makeMentionBroadcast(
   mentions: RelayMessageData["mentions"],
-  senderId = "user-human-1"
+  senderId = "user-human-1",
+  roomId = "room-001"
 ): string {
   const data: RelayMessageData = {
     id: "m1",
     message_id: 1,
-    room_id: "room-001",
+    room_id: roomId,
     sender_id: senderId,
     sender_name: "Alice",
     text: "Hello @TestBot",
@@ -80,7 +79,7 @@ function makeMessageBroadcast(
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
-describe("ClawPondWsClient", () => {
+describe("ClawPondWsClient – connection", () => {
   let wss: WebSocketServer;
   let port: number;
 
@@ -94,420 +93,507 @@ describe("ClawPondWsClient", () => {
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
-  // ── connection ─────────────────────────────────────────────────────────────
+  it("establishes a single WebSocket connection on connect()", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
 
-  describe("connectRoom", () => {
-    it("establishes a WebSocket connection to the correct URL", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-      const room = makeRoom();
+    const connPromise = waitForConnection(wss);
+    client.connect();
+    const serverSocket = await connPromise;
 
-      const connPromise = waitForConnection(wss);
-      client.connectRoom(room);
-      const serverSocket = await connPromise;
-
-      expect(serverSocket).toBeDefined();
-      await client.disconnectAll();
-    });
-
-    it("includes correct query parameters in the connection URL", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-      const room = makeRoom({ roomId: "room-xyz", userId: "agent-uuid-99" });
-
-      let receivedUrl = "";
-      wss.once("connection", (_sock, req) => { receivedUrl = req.url ?? ""; });
-
-      client.connectRoom(room);
-      await new Promise<void>((resolve) => wss.once("connection", () => resolve()));
-
-      expect(receivedUrl).toContain("/ws/room-xyz");
-      expect(receivedUrl).toContain("user_id=agent-uuid-99");
-      expect(receivedUrl).toContain("username=TestBot");
-      expect(receivedUrl).toContain("user_type=agent");
-      expect(receivedUrl).toContain("role=member");
-
-      await client.disconnectAll();
-    });
-
-    it("calls deps.onReady when the connection opens", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-
-      client.connectRoom(makeRoom());
-      await new Promise<void>((resolve) => {
-        (deps.onReady as jest.Mock).mockImplementation(resolve);
-      });
-
-      expect(deps.onReady).toHaveBeenCalledTimes(1);
-      await client.disconnectAll();
-    });
+    expect(serverSocket).toBeDefined();
+    await client.disconnectAll();
   });
 
-  // ── @mention filtering ─────────────────────────────────────────────────────
+  it("URL contains agent_id, agent_secret, user_type=agent", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
 
-  describe("@mention detection via onMessage", () => {
-    it("triggers the handler for a structured agentId mention", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-      const handler = jest.fn();
-      client.onMessage(handler);
+    let receivedUrl = "";
+    wss.once("connection", (_sock, req) => { receivedUrl = req.url ?? ""; });
 
-      const room = makeRoom({ agentId: "agent-uuid-1" });
-      client.connectRoom(room);
-      const serverSocket = await waitForConnection(wss);
+    client.connect();
+    await waitForConnection(wss);
 
-      await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+    expect(receivedUrl).toContain("agent_id=test-agent-uuid");
+    expect(receivedUrl).toContain("agent_secret=test-secret");
+    expect(receivedUrl).toContain("user_type=agent");
 
-      const msg = makeMessageBroadcast([{ agentId: "agent-uuid-1", username: "TestBot" }]);
-      serverSocket.send(msg);
-
-      await new Promise((r) => setTimeout(r, 50));
-      expect(handler).toHaveBeenCalledTimes(1);
-      await client.disconnectAll();
-    });
-
-    it("triggers the handler for a legacy string mention (case-insensitive)", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-      const handler = jest.fn();
-      client.onMessage(handler);
-
-      client.connectRoom(makeRoom());
-      const serverSocket = await waitForConnection(wss);
-      await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
-
-      // lower-case variant of the agent name
-      serverSocket.send(makeMessageBroadcast(["testbot"]));
-      await new Promise((r) => setTimeout(r, 50));
-      expect(handler).toHaveBeenCalledTimes(1);
-      await client.disconnectAll();
-    });
-
-    it("does NOT trigger the handler when there is no matching mention", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-      const handler = jest.fn();
-      client.onMessage(handler);
-
-      client.connectRoom(makeRoom());
-      const serverSocket = await waitForConnection(wss);
-      await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
-
-      serverSocket.send(makeMessageBroadcast([]));
-      await new Promise((r) => setTimeout(r, 50));
-      expect(handler).not.toHaveBeenCalled();
-      await client.disconnectAll();
-    });
-
-    it("does NOT trigger the handler for a different agentId", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-      const handler = jest.fn();
-      client.onMessage(handler);
-
-      client.connectRoom(makeRoom({ agentId: "agent-uuid-1" }));
-      const serverSocket = await waitForConnection(wss);
-      await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
-
-      serverSocket.send(makeMessageBroadcast([{ agentId: "agent-uuid-OTHER", username: "OtherBot" }]));
-      await new Promise((r) => setTimeout(r, 50));
-      expect(handler).not.toHaveBeenCalled();
-      await client.disconnectAll();
-    });
-
-    it("does NOT trigger the handler for own messages (sender_id === userId)", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-      const handler = jest.fn();
-      client.onMessage(handler);
-
-      const room = makeRoom({ agentId: "agent-uuid-1", userId: "agent-agent-uuid-1" });
-      client.connectRoom(room);
-      const serverSocket = await waitForConnection(wss);
-      await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
-
-      // sender_id equals the agent's own userId
-      serverSocket.send(
-        makeMessageBroadcast([{ agentId: "agent-uuid-1", username: "TestBot" }], "agent-agent-uuid-1")
-      );
-      await new Promise((r) => setTimeout(r, 50));
-      expect(handler).not.toHaveBeenCalled();
-      await client.disconnectAll();
-    });
-
-    it("ignores broadcasts with non-message events", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-      const handler = jest.fn();
-      client.onMessage(handler);
-
-      client.connectRoom(makeRoom());
-      const serverSocket = await waitForConnection(wss);
-      await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
-
-      serverSocket.send(JSON.stringify({ event: "memberJoined", data: {} }));
-      await new Promise((r) => setTimeout(r, 50));
-      expect(handler).not.toHaveBeenCalled();
-      await client.disconnectAll();
-    });
-
-    it("ignores malformed JSON without throwing", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-
-      client.connectRoom(makeRoom());
-      const serverSocket = await waitForConnection(wss);
-      await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
-
-      expect(() => serverSocket.send("NOT_VALID_JSON")).not.toThrow();
-      await new Promise((r) => setTimeout(r, 50));
-      expect(deps.logger.warn).toHaveBeenCalledWith(
-        "clawpond_ws_parse_error",
-        expect.objectContaining({ error: expect.any(String) })
-      );
-      await client.disconnectAll();
-    });
+    await client.disconnectAll();
   });
 
-  // ── sendMessage ────────────────────────────────────────────────────────────
+  it("calls deps.onReady when connection opens", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
 
-  describe("sendMessage", () => {
-    it("sends a correctly formatted JSON payload", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-
-      client.connectRoom(makeRoom({ roomId: "room-001" }));
-      const serverSocket = await waitForConnection(wss);
-      await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
-
-      const received = await new Promise<string>((resolve) => {
-        serverSocket.once("message", (data) => resolve(data.toString()));
-        client.sendMessage("room-001", "Hi there");
-      });
-
-      const parsed = JSON.parse(received);
-      expect(parsed.method).toBe("sendMessage");
-      expect(parsed.params.text).toBe("Hi there");
-      expect(parsed.params.reply_to).toBeUndefined();
-
-      await client.disconnectAll();
+    client.connect();
+    await new Promise<void>((resolve) => {
+      (deps.onReady as jest.Mock).mockImplementation(resolve);
     });
 
-    it("includes reply_to when provided", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
+    expect(deps.onReady).toHaveBeenCalledTimes(1);
+    await client.disconnectAll();
+  });
+});
 
-      client.connectRoom(makeRoom({ roomId: "room-001" }));
-      const serverSocket = await waitForConnection(wss);
-      await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+describe("ClawPondWsClient – joinRoom", () => {
+  let wss: WebSocketServer;
+  let port: number;
 
-      const received = await new Promise<string>((resolve) => {
-        serverSocket.once("message", (data) => resolve(data.toString()));
-        client.sendMessage("room-001", "Reply!", 99);
-      });
-
-      const parsed = JSON.parse(received);
-      expect(parsed.params.reply_to).toBe(99);
-
-      await client.disconnectAll();
-    });
-
-    it("returns false and logs a warning when the room is not connected", () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-
-      const result = client.sendMessage("nonexistent-room", "Hello");
-      expect(result).toBe(false);
-      expect(deps.logger.warn).toHaveBeenCalledWith(
-        "clawpond_ws_send_failed_not_open",
-        expect.objectContaining({ roomId: "nonexistent-room" })
-      );
-    });
-
-    it("returns true on a successful send", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-
-      client.connectRoom(makeRoom({ roomId: "room-001" }));
-      await waitForConnection(wss);
-      await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
-
-      const result = client.sendMessage("room-001", "Hello");
-      expect(result).toBe(true);
-
-      await client.disconnectAll();
-    });
+  beforeEach(async () => {
+    const srv = await startServer();
+    wss = srv.wss;
+    port = srv.port;
   });
 
-  // ── disconnectAll ──────────────────────────────────────────────────────────
-
-  describe("disconnectAll", () => {
-    it("closes all open connections", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-
-      client.connectRoom(makeRoom({ roomId: "r1" }));
-      client.connectRoom(makeRoom({ roomId: "r2" }));
-      await new Promise((r) => setTimeout(r, 100));
-
-      await client.disconnectAll();
-
-      // After disconnectAll, further sends should fail
-      expect(client.sendMessage("r1", "test")).toBe(false);
-      expect(client.sendMessage("r2", "test")).toBe(false);
-    });
+  afterEach(async () => {
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
-  // ── stop function ──────────────────────────────────────────────────────────
+  it("sends joinRoom message when called after connection is open", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
 
-  describe("connectRoom stop function", () => {
-    it("stops the connection for the specific room", async () => {
-      const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
+    client.connect();
+    const serverSocket = await waitForConnection(wss);
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
 
-      const stop = client.connectRoom(makeRoom({ roomId: "room-001" }));
-      await waitForConnection(wss);
-      await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
-
-      stop();
-
-      // Send should fail because the room is no longer tracked
-      expect(client.sendMessage("room-001", "test")).toBe(false);
-      await client.disconnectAll();
+    const received = await new Promise<string>((resolve) => {
+      serverSocket.once("message", (data) => resolve(data.toString()));
+      client.joinRoom("room-001", "secret-password");
     });
+
+    const parsed = JSON.parse(received);
+    expect(parsed.method).toBe("joinRoom");
+    expect(parsed.params.password).toBe("secret-password");
+
+    await client.disconnectAll();
   });
 
-  // ── exponential back-off reconnection ─────────────────────────────────────
+  it("sends joinRoom for all queued rooms when connection opens", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
 
-  describe("exponential back-off reconnection", () => {
-    it("reconnects after the server closes the connection", async () => {
-      const account = makeAccount({
-        relayWsUrl: `ws://localhost:${port}`,
-        reconnectInterval: 30,
-        maxReconnectDelay: 500,
-      });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
+    // Queue rooms before connecting
+    client.joinRoom("room-A", "pass-A");
+    client.joinRoom("room-B", "pass-B");
 
-      let connectionCount = 0;
-      wss.on("connection", () => { connectionCount++; });
-
-      client.connectRoom(makeRoom());
-      // Wait for first connection
-      await new Promise((r) => setTimeout(r, 100));
-      expect(connectionCount).toBe(1);
-
-      // Close all server-side sockets to trigger client reconnect
-      wss.clients.forEach((s) => s.close());
-
-      // Wait for at least one reconnect attempt
-      await new Promise((r) => setTimeout(r, 200));
-      expect(connectionCount).toBeGreaterThanOrEqual(2);
-
-      await client.disconnectAll();
+    const receivedMessages: string[] = [];
+    wss.once("connection", (serverSocket) => {
+      serverSocket.on("message", (data) => receivedMessages.push(data.toString()));
     });
 
-    it("does not reconnect after stop() is called", async () => {
-      const account = makeAccount({
-        relayWsUrl: `ws://localhost:${port}`,
-        reconnectInterval: 30,
-        maxReconnectDelay: 500,
-      });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
+    client.connect();
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+    await new Promise((r) => setTimeout(r, 50));
 
-      let connectionCount = 0;
-      wss.on("connection", () => { connectionCount++; });
+    const parsed = receivedMessages.map((m) => JSON.parse(m));
+    const passwords = parsed.map((p) => p.params.password);
+    expect(passwords).toContain("pass-A");
+    expect(passwords).toContain("pass-B");
 
-      const stop = client.connectRoom(makeRoom());
-      await new Promise((r) => setTimeout(r, 80));
-      expect(connectionCount).toBe(1);
-
-      // Stop before the server closes
-      stop();
-      wss.clients.forEach((s) => s.close());
-
-      await new Promise((r) => setTimeout(r, 200));
-      // Should still be 1 – no reconnect happened
-      expect(connectionCount).toBe(1);
-    });
-
-    it("respects maxReconnectDelay cap", async () => {
-      jest.useFakeTimers();
-      const account = makeAccount({
-        relayWsUrl: `ws://localhost:${port}`,
-        reconnectInterval: 100,
-        maxReconnectDelay: 300,
-      });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-
-      // spy on the private method through logger.info calls
-      const scheduleInfoCalls: number[] = [];
-      (deps.logger.info as jest.Mock).mockImplementation((msg: string, meta?: Record<string, unknown>) => {
-        if (msg === "clawpond_ws_reconnecting" && meta?.delayMs !== undefined) {
-          scheduleInfoCalls.push(meta.delayMs as number);
-        }
-      });
-
-      // Simulate multiple reconnects manually by calling _scheduleReconnect indirectly
-      // We do this by direct property access since we can't use fake timers with a live WS server
-      // Instead validate the delay math: base=100, max=300
-      // attempt 0 → delay = min(100*2^0, 300) = 100
-      // attempt 1 → delay = min(100*2^1, 300) = 200
-      // attempt 2 → delay = min(100*2^2, 300) = 300
-      // attempt 3 → delay = min(100*2^3, 300) = 300 (capped)
-      const base = 100;
-      const max = 300;
-      for (let i = 0; i < 4; i++) {
-        const delay = Math.min(base * Math.pow(2, i), max);
-        expect(delay).toBeLessThanOrEqual(max);
-      }
-      expect(Math.min(base * Math.pow(2, 3), max)).toBe(300);
-
-      jest.useRealTimers();
-      await client.disconnectAll();
-    });
+    await client.disconnectAll();
   });
 
-  // ── error handling ─────────────────────────────────────────────────────────
-
-  describe("error handling", () => {
-    it("calls deps.onDisconnect when the server closes the connection", async () => {
-      const account = makeAccount({
-        relayWsUrl: `ws://localhost:${port}`,
-        reconnectInterval: 5000, // long delay so reconnect doesn't fire in test
-      });
-      const deps = makeDeps();
-      const client = new ClawPondWsClient(account, deps);
-
-      client.connectRoom(makeRoom());
-      const serverSocket = await waitForConnection(wss);
-      await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
-
-      // Close from server side
-      serverSocket.close();
-      await new Promise((r) => setTimeout(r, 100));
-
-      expect(deps.onDisconnect).toHaveBeenCalled();
-      await client.disconnectAll();
+  it("re-subscribes all rooms after reconnection", async () => {
+    const account = makeAccount({
+      relayWsUrl: `ws://localhost:${port}`,
+      reconnectInterval: 30,
+      maxReconnectDelay: 200,
     });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+
+    client.joinRoom("room-001", "password-1");
+
+    const joinMessages: string[] = [];
+    wss.on("connection", (serverSocket) => {
+      serverSocket.on("message", (data) => joinMessages.push(data.toString()));
+    });
+
+    client.connect();
+    // Wait for first connection and joinRoom
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Disconnect from server side to trigger reconnect
+    wss.clients.forEach((s) => s.close());
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Should have joinRoom from both initial + reconnect
+    const joinRoomMessages = joinMessages
+      .map((m) => JSON.parse(m))
+      .filter((p) => p.method === "joinRoom");
+
+    expect(joinRoomMessages.length).toBeGreaterThanOrEqual(2);
+    expect(joinRoomMessages[0].params.password).toBe("password-1");
+
+    await client.disconnectAll();
+  });
+});
+
+describe("ClawPondWsClient – sendMessage", () => {
+  let wss: WebSocketServer;
+  let port: number;
+
+  beforeEach(async () => {
+    const srv = await startServer();
+    wss = srv.wss;
+    port = srv.port;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("sends payload with method, room_id, text", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+
+    client.connect();
+    const serverSocket = await waitForConnection(wss);
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    // Consume the joinRoom messages first if any
+    const received = await new Promise<string>((resolve) => {
+      serverSocket.once("message", (data) => resolve(data.toString()));
+      client.sendMessage("room-001", "Hello world");
+    });
+
+    const parsed = JSON.parse(received);
+    expect(parsed.method).toBe("sendMessage");
+    expect(parsed.params.room_id).toBe("room-001");
+    expect(parsed.params.text).toBe("Hello world");
+    expect(parsed.params.reply_to).toBeUndefined();
+
+    await client.disconnectAll();
+  });
+
+  it("includes reply_to when provided", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+
+    client.connect();
+    const serverSocket = await waitForConnection(wss);
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    const received = await new Promise<string>((resolve) => {
+      serverSocket.once("message", (data) => resolve(data.toString()));
+      client.sendMessage("room-001", "Reply!", 42);
+    });
+
+    const parsed = JSON.parse(received);
+    expect(parsed.params.reply_to).toBe(42);
+
+    await client.disconnectAll();
+  });
+
+  it("returns false and warns when not connected", () => {
+    const account = makeAccount({ relayWsUrl: "ws://localhost:9" });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+
+    const result = client.sendMessage("room-001", "test");
+    expect(result).toBe(false);
+    expect(deps.logger.warn).toHaveBeenCalledWith(
+      "clawpond_ws_send_failed_not_open",
+      expect.objectContaining({ roomId: "room-001" })
+    );
+  });
+
+  it("returns true on successful send", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+
+    client.connect();
+    await waitForConnection(wss);
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    const result = client.sendMessage("room-001", "Hello");
+    expect(result).toBe(true);
+
+    await client.disconnectAll();
+  });
+});
+
+describe("ClawPondWsClient – @mention detection", () => {
+  let wss: WebSocketServer;
+  let port: number;
+
+  beforeEach(async () => {
+    const srv = await startServer();
+    wss = srv.wss;
+    port = srv.port;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("triggers handler for structured agentId mention", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+    const handler = jest.fn();
+    client.onMessage(handler);
+
+    client.connect();
+    const serverSocket = await waitForConnection(wss);
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    serverSocket.send(makeMentionBroadcast([{ agentId: "test-agent-uuid", username: "TestBot" }]));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    await client.disconnectAll();
+  });
+
+  it("triggers handler for legacy string mention (case-insensitive)", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+    const handler = jest.fn();
+    client.onMessage(handler);
+
+    client.connect();
+    const serverSocket = await waitForConnection(wss);
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    serverSocket.send(makeMentionBroadcast(["testbot"]));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    await client.disconnectAll();
+  });
+
+  it("does NOT trigger for non-matching mention", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+    const handler = jest.fn();
+    client.onMessage(handler);
+
+    client.connect();
+    const serverSocket = await waitForConnection(wss);
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    serverSocket.send(makeMentionBroadcast([{ agentId: "other-agent", username: "OtherBot" }]));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(handler).not.toHaveBeenCalled();
+    await client.disconnectAll();
+  });
+
+  it("does NOT trigger for own messages (sender_id === agent-{agentId})", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+    const handler = jest.fn();
+    client.onMessage(handler);
+
+    client.connect();
+    const serverSocket = await waitForConnection(wss);
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    // sender_id = "agent-{agentId}"
+    serverSocket.send(
+      makeMentionBroadcast(
+        [{ agentId: "test-agent-uuid", username: "TestBot" }],
+        "agent-test-agent-uuid"
+      )
+    );
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(handler).not.toHaveBeenCalled();
+    await client.disconnectAll();
+  });
+
+  it("ignores non-message events", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+    const handler = jest.fn();
+    client.onMessage(handler);
+
+    client.connect();
+    const serverSocket = await waitForConnection(wss);
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    serverSocket.send(JSON.stringify({ event: "memberJoined", data: {} }));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(handler).not.toHaveBeenCalled();
+    await client.disconnectAll();
+  });
+
+  it("ignores malformed JSON without throwing", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+
+    client.connect();
+    const serverSocket = await waitForConnection(wss);
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    expect(() => serverSocket.send("NOT_VALID_JSON")).not.toThrow();
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(deps.logger.warn).toHaveBeenCalledWith(
+      "clawpond_ws_parse_error",
+      expect.objectContaining({ error: expect.any(String) })
+    );
+    await client.disconnectAll();
+  });
+
+  it("passes roomId from message data to the handler", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+    const handler = jest.fn();
+    client.onMessage(handler);
+
+    client.connect();
+    const serverSocket = await waitForConnection(wss);
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    serverSocket.send(
+      makeMentionBroadcast(
+        [{ agentId: "test-agent-uuid", username: "TestBot" }],
+        "user-1",
+        "specific-room-id"
+      )
+    );
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({ room_id: "specific-room-id" }),
+      "specific-room-id"
+    );
+    await client.disconnectAll();
+  });
+});
+
+describe("ClawPondWsClient – reconnection", () => {
+  let wss: WebSocketServer;
+  let port: number;
+
+  beforeEach(async () => {
+    const srv = await startServer();
+    wss = srv.wss;
+    port = srv.port;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("reconnects after server closes the connection", async () => {
+    const account = makeAccount({
+      relayWsUrl: `ws://localhost:${port}`,
+      reconnectInterval: 30,
+      maxReconnectDelay: 500,
+    });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+
+    let connectionCount = 0;
+    wss.on("connection", () => { connectionCount++; });
+
+    client.connect();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(connectionCount).toBe(1);
+
+    wss.clients.forEach((s) => s.close());
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(connectionCount).toBeGreaterThanOrEqual(2);
+    await client.disconnectAll();
+  });
+
+  it("does not reconnect after disconnectAll()", async () => {
+    const account = makeAccount({
+      relayWsUrl: `ws://localhost:${port}`,
+      reconnectInterval: 30,
+      maxReconnectDelay: 200,
+    });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+
+    let connectionCount = 0;
+    wss.on("connection", () => { connectionCount++; });
+
+    client.connect();
+    await new Promise((r) => setTimeout(r, 80));
+    expect(connectionCount).toBe(1);
+
+    await client.disconnectAll();
+    wss.clients.forEach((s) => s.close());
+
+    await new Promise((r) => setTimeout(r, 200));
+    expect(connectionCount).toBe(1);
+  });
+
+  it("respects maxReconnectDelay cap in delay calculation", () => {
+    const base = 100;
+    const max = 300;
+    for (let i = 0; i < 5; i++) {
+      const delay = Math.min(base * Math.pow(2, i), max);
+      expect(delay).toBeLessThanOrEqual(max);
+    }
+    expect(Math.min(base * Math.pow(2, 3), max)).toBe(300);
+  });
+
+  it("calls deps.onDisconnect when server closes the connection", async () => {
+    const account = makeAccount({
+      relayWsUrl: `ws://localhost:${port}`,
+      reconnectInterval: 5000,
+    });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+
+    client.connect();
+    const serverSocket = await waitForConnection(wss);
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    serverSocket.close();
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(deps.onDisconnect).toHaveBeenCalled();
+    await client.disconnectAll();
+  });
+});
+
+describe("ClawPondWsClient – disconnectAll", () => {
+  let wss: WebSocketServer;
+  let port: number;
+
+  beforeEach(async () => {
+    const srv = await startServer();
+    wss = srv.wss;
+    port = srv.port;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("stops the connection and makes sendMessage return false", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+    const client = new ClawPondWsClient(account, deps);
+
+    client.connect();
+    await waitForConnection(wss);
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    await client.disconnectAll();
+    expect(client.sendMessage("room-001", "test")).toBe(false);
   });
 });

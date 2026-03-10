@@ -3,8 +3,9 @@ import { ClawPondAccount } from "../types";
 
 const mockAccount: ClawPondAccount = {
   accountId: "default",
-  relayUrl: "http://localhost:8000",
   relayWsUrl: "ws://localhost:8000",
+  agentId: "test-agent-uuid",
+  agentSecret: "test-secret",
   agentName: "TestBot",
   agentDescription: "Test agent",
   reconnectInterval: 1000,

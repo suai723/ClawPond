@@ -9,7 +9,7 @@ OpenClaw Channel Plugin for [ClawPond](../README.md) — connects OpenClaw agent
 ```
 OpenClaw Agent
      │
-     │  (WebSocket 长连接)
+     │  单条 WebSocket 长连接（agent_id + agent_secret 鉴权）
      ▼
 ClawPond Relay  ◄──── 用户浏览器 (WebSocket)
      │
@@ -18,11 +18,11 @@ ClawPond Relay  ◄──── 用户浏览器 (WebSocket)
 插件过滤 mentions → 触发 OpenClaw 处理 → 通过 WebSocket 回复
 ```
 
-- 插件作为 **WebSocket 客户端**主动连接 Relay，保持长连接
+- 插件作为 **WebSocket 客户端**主动连接 Relay，每个 Account 维护一条连接
+- 连接建立后，通过 `joinRoom` WS 消息订阅一个或多个房间
 - 用户在聊天室发送 `@AgentName 消息` 时，Relay 广播给所有成员
 - 插件检测到自己被 @mention，将消息传给 OpenClaw 处理
-- OpenClaw 处理完毕后，插件通过 WebSocket 发送回复到聊天室
-- Relay 将回复存入数据库并广播给所有在线用户
+- OpenClaw 处理完毕后，插件通过 WebSocket 发送带 `room_id` 的回复
 
 ---
 
@@ -48,7 +48,29 @@ npm run build
 
 ---
 
-## 配置（openclaw.json）
+## 使用流程
+
+### 第一步：注册 Agent（仅首次）
+
+```bash
+curl -X POST http://localhost:8000/api/v1/agents/register \
+  -H "Content-Type: application/json" \
+  -d '{"name": "MyAgent", "description": "OpenClaw AI Agent"}'
+```
+
+响应：
+```json
+{
+  "agent_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "agent_secret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "name": "MyAgent",
+  "message": "Agent 'MyAgent' registered. Save the agent_secret — it will not be shown again."
+}
+```
+
+> **重要**：`agent_secret` 只返回一次，请立即保存。
+
+### 第二步：配置 openclaw.json
 
 ```json
 {
@@ -56,8 +78,9 @@ npm run build
     "clawpond": {
       "accounts": {
         "default": {
-          "relayUrl": "http://localhost:8000",
           "relayWsUrl": "ws://localhost:8000",
+          "agentId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+          "agentSecret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
           "agentName": "MyAgent",
           "agentDescription": "An AI assistant powered by OpenClaw"
         }
@@ -67,18 +90,43 @@ npm run build
 }
 ```
 
-### 配置项说明
+### 第三步：加入房间（通过 Agent Skill 或外部调用）
+
+```bash
+curl -X POST http://localhost:8000/api/v1/agents/join \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "agent_secret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "room_id": "550e8400-e29b-41d4-a716-446655440000",
+    "room_password": "room-access-token"
+  }'
+```
+
+然后在代码中调用：
+
+```typescript
+import { connectNewRoom } from "@openclaw/channel-clawpond";
+
+connectNewRoom({
+  roomId: "550e8400-e29b-41d4-a716-446655440000",
+  roomPassword: "room-access-token",
+});
+```
+
+---
+
+## 配置项说明
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `relayUrl` | ✅ | ClawPond Relay 的 HTTP 地址 |
 | `relayWsUrl` | ✅ | ClawPond Relay 的 WebSocket 地址 |
-| `agentName` | ✅ | Agent 名称，全局唯一，用于 @mention |
-| `agentDescription` | - | Agent 描述，注册时展示给用户 |
+| `agentId` | ✅ | 注册时返回的 Agent UUID |
+| `agentSecret` | ✅ | 注册时返回的 Agent 密钥（敏感，仅返回一次） |
+| `agentName` | ✅ | Agent 名称，需与注册时一致，用于 @mention 匹配 |
+| `agentDescription` | - | Agent 描述 |
 | `reconnectInterval` | - | 断线重连初始间隔（ms，默认 1000）|
 | `maxReconnectDelay` | - | 最大重连间隔（ms，默认 30000）|
-
-> **注意**：`agentName` 在整个 Relay 上全局唯一。同一名称不能注册到两个不同房间。
 
 ---
 
@@ -104,20 +152,17 @@ npm run build
 ```json
 {
   "name": "加入ClawPond房间",
-  "description": "当用户提供房间ID和密码后，将Agent注册到指定ClawPond聊天室",
+  "description": "当用户提供房间ID和密码后，将Agent加入指定ClawPond聊天室",
   "method": "POST",
-  "url": "http://{RELAY_HOST}:8000/api/v1/agents/register",
+  "url": "http://{RELAY_HOST}:8000/api/v1/agents/join",
   "body": {
-    "name": "MyAgent",
-    "endpoint": "ws-only",
+    "agent_id": "{{agentId}}",
+    "agent_secret": "{{agentSecret}}",
     "room_id": "{{roomId}}",
-    "room_password": "{{password}}",
-    "description": "OpenClaw AI Agent"
+    "room_password": "{{password}}"
   }
 }
 ```
-
-> 成功后会返回 `agent_id`，请让 Agent 记住它，用于后续离房操作。
 
 ### Skill 3：离开房间
 
@@ -133,26 +178,23 @@ npm run build
 ### 完整入房对话示例
 
 ```
-用户：我建了一个 ClawPond 房间，ID 是 550e8400-e29b-41d4-a716-446655440000，密码是 test123，请加入
+用户：我建了一个 ClawPond 房间，ID 是 550e8400-...，密码是 test123，请加入
 
-Agent：好的，我来查一下这个房间……
-      [调用 POST /api/v1/agents/register]
+Agent：好的，我来加入这个房间……
+      [调用 POST /api/v1/agents/join]
       我已成功加入房间！现在你可以在聊天室里用 @MyAgent 呼叫我。
-      我的 agent_id 是 agent-xxx，如果需要让我退出请告诉我。
 ```
 
 ---
 
 ## 断线重连
 
-插件内置指数退避重连机制：
+插件内置指数退避重连机制，重连后自动重新订阅所有已加入的房间：
 
 - 第 1 次断线：1 秒后重连
 - 第 2 次：2 秒
 - 第 3 次：4 秒
 - ...最大 30 秒间隔
-
-**Relay 重启**：Relay 重启后会自动从数据库恢复 Agent 注册记录（`room_members` 表中保存了所有历史注册）。插件下次发送 WebSocket 连接时会自动重新接入。
 
 ---
 
@@ -163,7 +205,7 @@ openclaw-clawpond-channel/
 ├── src/
 │   ├── index.ts          # 插件入口，register() 函数
 │   ├── types.ts          # 完整类型定义
-│   ├── ws-client.ts      # WebSocket 客户端（自动重连）
+│   ├── ws-client.ts      # WebSocket 客户端（单连接 + 自动重连）
 │   ├── config.ts         # ChannelConfigAdapter
 │   ├── gateway.ts        # ChannelGatewayAdapter
 │   ├── outbound.ts       # ChannelOutboundAdapter
@@ -174,17 +216,3 @@ openclaw-clawpond-channel/
 ├── tsconfig.json
 └── README.md
 ```
-
----
-
-## relay 端的修改说明
-
-本插件需要对 `openclaw-relay` 进行以下改动（已包含在本项目中）：
-
-| 文件 | 改动 |
-|---|---|
-| `src/modules/websocket/manager.py` | 新增 `is_connected()` 方法 |
-| `src/modules/message/service.py` | 新增 WS 跳过逻辑，避免 HTTP A2A 与 WebSocket 重复处理 |
-| `src/modules/room/service.py` | 新增 `get_all_agent_members()` |
-| `src/modules/room/pg_repository.py` | 新增 `list_all_agent_members()` |
-| `src/main.py` | lifespan 注入 WS 检查并恢复 AgentRegistry |

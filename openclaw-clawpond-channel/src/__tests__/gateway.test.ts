@@ -1,8 +1,8 @@
 /**
  * gateway.test.ts
  *
- * Uses jest.spyOn(global, 'fetch') to mock the HTTP call inside fetchJoinedRooms,
- * and a real WebSocketServer for the WS connections.
+ * Tests gateway lifecycle and connectNewRoom() with the single-connection model.
+ * Uses a real WebSocketServer; no HTTP mocks needed.
  */
 
 import { WebSocketServer } from "ws";
@@ -14,11 +14,12 @@ import { ClawPondAccount, GatewayDeps } from "../types";
 function makeAccount(overrides: Partial<ClawPondAccount> = {}): ClawPondAccount {
   return {
     accountId: "default",
-    relayUrl: "http://relay-test.local",
-    relayWsUrl: "ws://localhost",   // will be overridden per-test
+    relayWsUrl: "ws://localhost",
+    agentId: "gateway-agent-uuid",
+    agentSecret: "gateway-secret",
     agentName: "GatewayBot",
     agentDescription: "Test",
-    reconnectInterval: 5000,        // long – we don't want reconnect noise
+    reconnectInterval: 5000,
     maxReconnectDelay: 30_000,
     ...overrides,
   };
@@ -40,13 +41,6 @@ function makeDeps(): GatewayDeps & {
   };
 }
 
-/** Build a mock Response for a successful /api/v1/agents GET */
-function makeAgentsResponse(agents: Array<{ agent_id: string; name: string; room_id: string | null }>) {
-  return Promise.resolve(
-    new Response(JSON.stringify({ agents }), { status: 200 })
-  );
-}
-
 async function startServer(): Promise<{ wss: WebSocketServer; port: number }> {
   return new Promise((resolve, reject) => {
     const wss = new WebSocketServer({ port: 0 });
@@ -60,132 +54,17 @@ async function startServer(): Promise<{ wss: WebSocketServer; port: number }> {
 
 // ── tests ─────────────────────────────────────────────────────────────────
 
-describe("fetchJoinedRooms (via gatewayAdapter.start)", () => {
-  let wss: WebSocketServer;
-  let port: number;
-  let fetchSpy: jest.SpyInstance;
-
-  beforeEach(async () => {
-    const srv = await startServer();
-    wss = srv.wss;
-    port = srv.port;
-    fetchSpy = jest.spyOn(global, "fetch");
-  });
-
-  afterEach(async () => {
-    fetchSpy.mockRestore();
-    await new Promise<void>((resolve) => wss.close(() => resolve()));
-  });
-
-  it("filters agents by agentName and builds JoinedRoom list", async () => {
-    fetchSpy.mockReturnValue(
-      makeAgentsResponse([
-        { agent_id: "uuid-1", name: "GatewayBot", room_id: "room-A" },
-        { agent_id: "uuid-2", name: "OtherBot",  room_id: "room-B" },
-        { agent_id: "uuid-3", name: "GatewayBot", room_id: "room-C" },
-      ])
-    );
-
-    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-    const deps = makeDeps();
-
-    // We just want to see that two rooms are connected (not zero)
-    let connectCount = 0;
-    wss.on("connection", () => { connectCount++; });
-
-    const { stop } = await gatewayAdapter.start(account, deps);
-    await new Promise((r) => setTimeout(r, 100));
-
-    expect(connectCount).toBe(2); // room-A + room-C
-    await stop();
-  });
-
-  it("calls onReady and logs a hint when there are no joined rooms", async () => {
-    fetchSpy.mockReturnValue(makeAgentsResponse([]));
-
-    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-    const deps = makeDeps();
-
-    const { stop } = await gatewayAdapter.start(account, deps);
-
-    expect(deps.onReady).toHaveBeenCalledTimes(1);
-    expect(deps.logger.info).toHaveBeenCalledWith(
-      "clawpond_no_joined_rooms",
-      expect.objectContaining({ agentName: "GatewayBot" })
-    );
-    await stop();
-  });
-
-  it("returns empty list and warns when the fetch throws", async () => {
-    fetchSpy.mockRejectedValue(new Error("Network error"));
-
-    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-    const deps = makeDeps();
-
-    const { stop } = await gatewayAdapter.start(account, deps);
-    await new Promise((r) => setTimeout(r, 50));
-
-    // Warn should have been called from the catch block
-    expect(deps.logger.warn).toHaveBeenCalledWith(
-      "clawpond_fetch_joined_rooms_failed",
-      expect.objectContaining({ error: expect.any(String) })
-    );
-    await stop();
-  });
-
-  it("returns empty list when the HTTP response is not ok", async () => {
-    fetchSpy.mockReturnValue(
-      Promise.resolve(new Response("", { status: 500 }))
-    );
-
-    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-    const deps = makeDeps();
-    let connectCount = 0;
-    wss.on("connection", () => { connectCount++; });
-
-    const { stop } = await gatewayAdapter.start(account, deps);
-    await new Promise((r) => setTimeout(r, 50));
-
-    expect(connectCount).toBe(0);
-    await stop();
-  });
-
-  it("ignores agents with null room_id", async () => {
-    fetchSpy.mockReturnValue(
-      makeAgentsResponse([
-        { agent_id: "uuid-1", name: "GatewayBot", room_id: null },
-      ])
-    );
-
-    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
-    const deps = makeDeps();
-    let connectCount = 0;
-    wss.on("connection", () => { connectCount++; });
-
-    const { stop } = await gatewayAdapter.start(account, deps);
-    await new Promise((r) => setTimeout(r, 50));
-
-    expect(connectCount).toBe(0);
-    await stop();
-  });
-});
-
 describe("gatewayAdapter lifecycle", () => {
   let wss: WebSocketServer;
   let port: number;
-  let fetchSpy: jest.SpyInstance;
 
   beforeEach(async () => {
     const srv = await startServer();
     wss = srv.wss;
     port = srv.port;
-    fetchSpy = jest.spyOn(global, "fetch").mockReturnValue(
-      makeAgentsResponse([{ agent_id: "uuid-1", name: "GatewayBot", room_id: "room-A" }])
-    );
   });
 
   afterEach(async () => {
-    fetchSpy.mockRestore();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
@@ -207,49 +86,102 @@ describe("gatewayAdapter lifecycle", () => {
     await stop();
     expect(getWsClient()).toBeNull();
   });
+
+  it("WS connects to the server after start()", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+
+    let connectCount = 0;
+    wss.on("connection", () => { connectCount++; });
+
+    const { stop } = await gatewayAdapter.start(account, deps);
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(connectCount).toBe(1);
+    await stop();
+  });
+
+  it("calls onReady once the WS connection opens", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+
+    const { stop } = await gatewayAdapter.start(account, deps);
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    expect(deps.onReady).toHaveBeenCalledTimes(1);
+    await stop();
+  });
 });
 
 describe("connectNewRoom", () => {
   let wss: WebSocketServer;
   let port: number;
-  let fetchSpy: jest.SpyInstance;
 
   beforeEach(async () => {
     const srv = await startServer();
     wss = srv.wss;
     port = srv.port;
-    // Start with no pre-joined rooms
-    fetchSpy = jest.spyOn(global, "fetch").mockReturnValue(makeAgentsResponse([]));
   });
 
   afterEach(async () => {
-    fetchSpy.mockRestore();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
-  it("returns null when gateway has not been started", () => {
-    // Ensure there is no active client
+  it("returns without error when gateway has not been started", () => {
     expect(getWsClient()).toBeNull();
-    const result = connectNewRoom({ roomId: "r1", agentId: "a1", userId: "agent-a1" });
-    expect(result).toBeNull();
+    // Should not throw
+    expect(() =>
+      connectNewRoom({ roomId: "r1", roomPassword: "pw1" })
+    ).not.toThrow();
   });
 
-  it("connects to the new room without affecting pre-existing rooms", async () => {
+  it("sends joinRoom WS message after gateway start", async () => {
     const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
     const deps = makeDeps();
 
     const { stop } = await gatewayAdapter.start(account, deps);
 
-    let connectCount = 0;
-    wss.on("connection", () => { connectCount++; });
+    const serverSocket = await new Promise<import("ws").WebSocket>((resolve) =>
+      wss.once("connection", (s) => resolve(s))
+    );
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
 
-    const stopRoom = connectNewRoom({ roomId: "dynamic-room", agentId: "uuid-d", userId: "agent-uuid-d" });
-    expect(stopRoom).not.toBeNull();
+    const joinMsg = await new Promise<string>((resolve) => {
+      serverSocket.once("message", (data) => resolve(data.toString()));
+      connectNewRoom({ roomId: "dynamic-room", roomPassword: "secret-pw" });
+    });
+
+    const parsed = JSON.parse(joinMsg);
+    expect(parsed.method).toBe("joinRoom");
+    expect(parsed.params.password).toBe("secret-pw");
+
+    await stop();
+  });
+
+  it("can connect multiple rooms independently", async () => {
+    const account = makeAccount({ relayWsUrl: `ws://localhost:${port}` });
+    const deps = makeDeps();
+
+    const { stop } = await gatewayAdapter.start(account, deps);
+
+    const serverSocket = await new Promise<import("ws").WebSocket>((resolve) =>
+      wss.once("connection", (s) => resolve(s))
+    );
+    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+
+    const joinMessages: string[] = [];
+    serverSocket.on("message", (data) => joinMessages.push(data.toString()));
+
+    connectNewRoom({ roomId: "room-1", roomPassword: "pw-1" });
+    connectNewRoom({ roomId: "room-2", roomPassword: "pw-2" });
 
     await new Promise((r) => setTimeout(r, 100));
-    expect(connectCount).toBe(1); // only the dynamically joined room
 
-    if (stopRoom) stopRoom();
+    const parsed = joinMessages.map((m) => JSON.parse(m));
+    const passwords = parsed.map((p) => p.params.password);
+    expect(passwords).toContain("pw-1");
+    expect(passwords).toContain("pw-2");
+
     await stop();
   });
 });

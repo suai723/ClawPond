@@ -16,48 +16,6 @@ export function getWsClient(): ClawPondWsClient | null {
   return _wsClient;
 }
 
-/**
- * Fetches the list of rooms that this agent has already joined on the relay.
- * The relay's GET /api/v1/agents endpoint returns all registered agents;
- * we filter by agentName and use the returned agent_id (UUID) as the identity.
- */
-async function fetchJoinedRooms(
-  account: ClawPondAccount,
-  deps: GatewayDeps
-): Promise<JoinedRoom[]> {
-  try {
-    const res = await fetch(
-      `${account.relayUrl}/api/v1/agents?` +
-        new URLSearchParams({ limit: "100" }).toString()
-    );
-    if (!res.ok) return [];
-
-    const body = (await res.json()) as { agents: Array<{
-      agent_id: string;
-      name: string;
-      room_id: string | null;
-    }> };
-
-    const joined: JoinedRoom[] = [];
-    for (const agent of body.agents ?? []) {
-      // 通过 agentName 找到属于本 agent 的记录
-      if (agent.name === account.agentName && agent.room_id) {
-        const agentId = agent.agent_id;
-        joined.push({
-          roomId: agent.room_id,
-          agentId,
-          // user_id 格式与注册时一致：agent-{agentId}
-          userId: `agent-${agentId}`,
-        });
-      }
-    }
-    return joined;
-  } catch (err) {
-    deps.logger.warn("clawpond_fetch_joined_rooms_failed", { error: String(err) });
-    return [];
-  }
-}
-
 export const gatewayAdapter: ChannelGatewayAdapter = {
   async start(
     account: ClawPondAccount,
@@ -65,8 +23,6 @@ export const gatewayAdapter: ChannelGatewayAdapter = {
   ): Promise<{ stop: () => Promise<void> }> {
     const wsClient = new ClawPondWsClient(account, deps);
     _wsClient = wsClient;
-
-    const stopFns: Array<() => void> = [];
 
     // Wire up @mention → OpenClaw
     const messagingDeps: MessagingDeps = {
@@ -78,26 +34,11 @@ export const gatewayAdapter: ChannelGatewayAdapter = {
       handleInboundMessage(data, roomId, account.accountId, messagingDeps);
     });
 
-    // Connect to all rooms this agent is already registered in
-    const joinedRooms = await fetchJoinedRooms(account, deps);
-
-    if (joinedRooms.length === 0) {
-      deps.logger.info("clawpond_no_joined_rooms", {
-        agentName: account.agentName,
-        hint: "Use the 'Join ClawPond Room' Agent Skill to join a room",
-      });
-      deps.onReady();
-    }
-
-    for (const room of joinedRooms) {
-      deps.logger.info("clawpond_connecting_room", { roomId: room.roomId });
-      const stop = wsClient.connectRoom(room);
-      stopFns.push(stop);
-    }
+    // Start the single WebSocket connection; onReady() is called once connected
+    wsClient.connect();
 
     return {
       async stop() {
-        for (const fn of stopFns) fn();
         await wsClient.disconnectAll();
         _wsClient = null;
       },
@@ -106,10 +47,10 @@ export const gatewayAdapter: ChannelGatewayAdapter = {
 };
 
 /**
- * Called externally (e.g. from a room-join webhook handler) to connect
- * the WsClient to a newly joined room at runtime.
+ * Called externally after HTTP room-join to subscribe the agent to a room.
+ * The WsClient sends a joinRoom WS message immediately if connected,
+ * or queues it for the next (re)connect.
  */
-export function connectNewRoom(joinedRoom: JoinedRoom): (() => void) | null {
-  if (!_wsClient) return null;
-  return _wsClient.connectRoom(joinedRoom);
+export function connectNewRoom(joinedRoom: JoinedRoom): void {
+  _wsClient?.joinRoom(joinedRoom.roomId, joinedRoom.roomPassword);
 }
