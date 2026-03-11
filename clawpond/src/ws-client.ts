@@ -20,6 +20,8 @@ export class ClawPondWsClient {
   private ws: WebSocket | null = null;
   private stopped = false;
   private reconnectAttempts = 0;
+  /** True after the first successful connection; gates onDisconnect() calls */
+  private _everReady = false;
   /** roomId → roomPassword (access_token) */
   private rooms = new Map<string, string>();
   private onMessageHandler: MessageHandler | null = null;
@@ -27,6 +29,9 @@ export class ClawPondWsClient {
   constructor(account: ClawPondAccount, deps: GatewayDeps) {
     this.account = account;
     this.deps = deps;
+    this.deps.logger.info("clawpond_ws_client_created", {
+      accountId: account.accountId,
+    });
   }
 
   /** Register a handler that receives @mention messages */
@@ -47,14 +52,19 @@ export class ClawPondWsClient {
     this.rooms.set(roomId, roomPassword);
 
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this._sendJoinRoom(roomPassword);
+      this._sendJoinRoom(roomId, roomPassword);
+    } else {
+      this.deps.logger.info("clawpond_ws_room_queued", { roomId });
     }
   }
 
   /** Send a chat message to a specific room */
   sendMessage(roomId: string, text: string, replyTo?: number): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      this.deps.logger.warn("clawpond_ws_send_failed_not_open", { roomId });
+      this.deps.logger.info("clawpond_ws_send_failed_not_open", {
+        roomId,
+        readyState: this.ws?.readyState,
+      });
       return false;
     }
 
@@ -68,12 +78,20 @@ export class ClawPondWsClient {
     };
 
     this.ws.send(JSON.stringify(payload));
+    this.deps.logger.info("clawpond_ws_send_ok", {
+      roomId,
+      textLength: text.length,
+    });
     return true;
   }
 
   /** Close the connection and stop all reconnect attempts */
   async disconnectAll(): Promise<void> {
+    this.deps.logger.info("clawpond_ws_disconnect_all", {
+      accountId: this.account.accountId,
+    });
     this.stopped = true;
+    this._everReady = false;
     try {
       this.ws?.close();
     } catch {
@@ -92,52 +110,84 @@ export class ClawPondWsClient {
       `&agent_secret=${encodeURIComponent(agentSecret)}` +
       `&user_type=agent`;
 
-    this.deps.logger.info("clawpond_ws_connecting", { url: `${relayWsUrl}/ws` });
+    const isReconnect = this.reconnectAttempts > 0;
+    this.deps.logger.info("clawpond_ws_connecting", {
+      url: `${relayWsUrl}/ws`,
+      ...(isReconnect ? { attempt: this.reconnectAttempts + 1 } : {}),
+    });
 
     const ws = new WebSocket(url);
     this.ws = ws;
 
     ws.on("open", () => {
       this.reconnectAttempts = 0;
+      this._everReady = true;
       this.deps.logger.info("clawpond_ws_connected");
       this.deps.onReady();
 
       // Re-subscribe to all rooms (handles initial connect and reconnect)
       for (const [roomId, roomPassword] of this.rooms) {
-        this.deps.logger.info("clawpond_ws_joining_room", { roomId });
-        this._sendJoinRoom(roomPassword);
+        this._sendJoinRoom(roomId, roomPassword);
       }
     });
 
     ws.on("message", (raw: WebSocket.RawData) => {
       try {
         const broadcast: RelayBroadcast = JSON.parse(raw.toString());
+        if (broadcast.event !== "message") {
+          this.deps.logger.info("clawpond_ws_broadcast", {
+            event: broadcast.event,
+          });
+        }
         this._handleBroadcast(broadcast);
       } catch (err) {
-        this.deps.logger.warn("clawpond_ws_parse_error", {
+        this.deps.logger.info("clawpond_ws_parse_error", {
           error: String(err),
         });
       }
     });
 
     ws.on("error", (err: Error) => {
-      this.deps.logger.error("clawpond_ws_error", { error: err.message });
-      this.deps.onError(err);
+      // Log connection-level errors (ECONNREFUSED, ETIMEDOUT, etc.) but do NOT
+      // forward to deps.onError — OpenClaw treats that as an unrecoverable fatal
+      // error and tears down the gateway. Transient connection failures are
+      // handled entirely by our own reconnect loop. The "close" event fires
+      // immediately after "error", which schedules the next reconnect attempt.
+      this.deps.logger.warn("clawpond_ws_error", {
+        error: err.message,
+        attempt: this.reconnectAttempts,
+      });
     });
 
     ws.on("close", (code: number, reason: Buffer) => {
+      const reasonStr = reason.toString();
       this.deps.logger.info("clawpond_ws_closed", {
         code,
-        reason: reason.toString(),
+        reason: reasonStr,
+        attemptAtClose: this.reconnectAttempts,
+        everReady: this._everReady,
       });
-      this.deps.onDisconnect();
-      this._scheduleReconnect();
+
+      if (!this.stopped) {
+        // Only signal disconnect to the host if we had previously announced
+        // readiness. This avoids a spurious onDisconnect before onReady which
+        // could cause OpenClaw to attempt an external gateway restart that
+        // races with our own reconnect loop.
+        if (this._everReady) {
+          this.deps.onDisconnect();
+        }
+        this._scheduleReconnect();
+      }
     });
   }
 
-  private _sendJoinRoom(roomPassword: string): void {
+  private _sendJoinRoom(roomId: string, roomPassword: string): void {
+    this.deps.logger.info("clawpond_ws_joining_room", { roomId });
     this.ws?.send(
-      JSON.stringify({ method: "joinRoom", params: { password: roomPassword } })
+      JSON.stringify({
+        method: "joinRoom",
+        params: { room_id: roomId, password: roomPassword },
+      })
     );
   }
 
@@ -182,6 +232,7 @@ export class ClawPondWsClient {
     this.deps.logger.info("clawpond_ws_reconnecting", {
       delayMs: delay,
       attempt: this.reconnectAttempts,
+      nextAttempt: this.reconnectAttempts + 1,
     });
 
     setTimeout(() => this._connect(), delay);

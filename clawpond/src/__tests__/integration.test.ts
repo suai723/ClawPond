@@ -2,7 +2,7 @@
  * integration.test.ts
  *
  * End-to-end integration test covering the full pipeline:
- *   gatewayAdapter.start()
+ *   gatewayAdapter.startAccount(ctx)
  *     → single WS connection with agent_id + agent_secret
  *     → connectNewRoom() sends joinRoom WS message
  *     → Mock WS Server broadcasts @mention message
@@ -15,7 +15,8 @@ import { gatewayAdapter, connectNewRoom, getWsClient } from "../gateway";
 import { createOutboundAdapter } from "../outbound";
 import {
   ClawPondAccount,
-  GatewayDeps,
+  GatewayStartAccountCtx,
+  OpenClawConfig,
   OutboundContext,
   ReplyContext,
   RelayBroadcast,
@@ -49,18 +50,38 @@ function makeAccount(port: number): ClawPondAccount {
   };
 }
 
-function makeDeps(emitHandler?: (inbound: ClawPondInbound) => void): GatewayDeps {
-  return {
-    logger: { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() },
-    emit: jest.fn((event, data) => {
-      if (event === "message:inbound" && emitHandler) {
-        emitHandler(data as ClawPondInbound);
-      }
-    }),
-    onReady: jest.fn(),
-    onError: jest.fn(),
-    onDisconnect: jest.fn(),
+function makeCtx(
+  port: number,
+  opts?: { abortSignal?: AbortSignal; emitHandler?: (inbound: ClawPondInbound) => void }
+): {
+  ctx: GatewayStartAccountCtx;
+  account: ClawPondAccount;
+  onReady: jest.Mock;
+} {
+  const account = makeAccount(port);
+  const log = jest.fn();
+  const emit = jest.fn((event: string, data: unknown) => {
+    if (event === "message:inbound" && opts?.emitHandler) {
+      opts.emitHandler(data as ClawPondInbound);
+    }
+  });
+  const onReady = jest.fn();
+  const onError = jest.fn();
+  const onDisconnect = jest.fn();
+  const cfg: OpenClawConfig = {
+    channels: { clawpond: { accounts: { integration: account } } },
   };
+  const ctx: GatewayStartAccountCtx = {
+    cfg,
+    accountId: "integration",
+    log,
+    emit,
+    onReady,
+    onError,
+    onDisconnect,
+    abortSignal: opts?.abortSignal,
+  };
+  return { ctx, account, onReady };
 }
 
 const AGENT_ID = "integ-agent-uuid";
@@ -100,33 +121,35 @@ describe("Full plugin pipeline integration", () => {
   });
 
   it("WS handshake carries agent_id and agent_secret query params", async () => {
-    const account = makeAccount(port);
-    const deps = makeDeps();
+    const controller = new AbortController();
+    const { ctx, account, onReady } = makeCtx(port, { abortSignal: controller.signal });
 
     let receivedUrl = "";
     wss.once("connection", (_sock, req) => { receivedUrl = req.url ?? ""; });
 
-    const { stop } = await gatewayAdapter.start(account, deps);
+    const startPromise = gatewayAdapter.startAccount(ctx);
+    await new Promise<void>((r) => onReady.mockImplementation(r));
     await new Promise((r) => setTimeout(r, 100));
 
     expect(receivedUrl).toContain(`agent_id=${AGENT_ID}`);
     expect(receivedUrl).toContain("agent_secret=integ-secret");
     expect(receivedUrl).toContain("user_type=agent");
 
-    await stop();
+    controller.abort();
+    await startPromise;
     expect(getWsClient()).toBeNull();
   });
 
   it("connectNewRoom sends joinRoom WS message with correct password", async () => {
-    const account = makeAccount(port);
-    const deps = makeDeps();
+    const controller = new AbortController();
+    const { ctx, account, onReady } = makeCtx(port, { abortSignal: controller.signal });
 
-    const { stop } = await gatewayAdapter.start(account, deps);
+    const startPromise = gatewayAdapter.startAccount(ctx);
 
     const serverSocket = await new Promise<WsWebSocket>((resolve) =>
       wss.once("connection", (s) => resolve(s))
     );
-    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+    await new Promise<void>((r) => onReady.mockImplementation(r));
 
     const joinMsg = await new Promise<string>((resolve) => {
       serverSocket.once("message", (data) => resolve(data.toString()));
@@ -135,22 +158,27 @@ describe("Full plugin pipeline integration", () => {
 
     const parsed = JSON.parse(joinMsg);
     expect(parsed.method).toBe("joinRoom");
+    expect(parsed.params.room_id).toBe(ROOM_ID);
     expect(parsed.params.password).toBe(ROOM_PASSWORD);
 
-    await stop();
+    controller.abort();
+    await startPromise;
   });
 
   it("receives @mention → emits inbound message to OpenClaw", async () => {
-    const account = makeAccount(port);
     const emittedMessages: ClawPondInbound[] = [];
-    const deps = makeDeps((inbound) => emittedMessages.push(inbound));
+    const controller = new AbortController();
+    const { ctx, account, onReady } = makeCtx(port, {
+      abortSignal: controller.signal,
+      emitHandler: (inbound) => emittedMessages.push(inbound),
+    });
 
-    const { stop } = await gatewayAdapter.start(account, deps);
+    const startPromise = gatewayAdapter.startAccount(ctx);
 
     const serverSocket = await new Promise<WsWebSocket>((resolve) =>
       wss.once("connection", (s) => resolve(s))
     );
-    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+    await new Promise<void>((r) => onReady.mockImplementation(r));
 
     connectNewRoom({ roomId: ROOM_ID, roomPassword: ROOM_PASSWORD });
     // consume the joinRoom message
@@ -171,19 +199,20 @@ describe("Full plugin pipeline integration", () => {
     expect(msg.peerId).toBe(ROOM_ID);
     expect(msg.peerKind).toBe("group");
 
-    await stop();
+    controller.abort();
+    await startPromise;
   });
 
   it("outbound sendText sends payload with room_id to the server", async () => {
-    const account = makeAccount(port);
-    const deps = makeDeps();
+    const controller = new AbortController();
+    const { ctx, account, onReady } = makeCtx(port, { abortSignal: controller.signal });
 
-    const { stop } = await gatewayAdapter.start(account, deps);
+    const startPromise = gatewayAdapter.startAccount(ctx);
 
     const serverSocket = await new Promise<WsWebSocket>((resolve) =>
       wss.once("connection", (s) => resolve(s))
     );
-    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+    await new Promise<void>((r) => onReady.mockImplementation(r));
 
     connectNewRoom({ roomId: ROOM_ID, roomPassword: ROOM_PASSWORD });
     await new Promise((r) => setTimeout(r, 50));
@@ -196,7 +225,7 @@ describe("Full plugin pipeline integration", () => {
       senderId: "user-human-1",
       accountId: "integration",
     };
-    const ctx: OutboundContext = {
+    const outboundCtx: OutboundContext = {
       text: "I can help!",
       target: { id: "target-1", replyContext },
       account,
@@ -204,7 +233,7 @@ describe("Full plugin pipeline integration", () => {
 
     const serverReceived = await new Promise<string>((resolve) => {
       serverSocket.once("message", (data) => resolve(data.toString()));
-      outbound.sendText(ctx);
+      outbound.sendText(outboundCtx);
     });
 
     const parsed = JSON.parse(serverReceived);
@@ -213,21 +242,25 @@ describe("Full plugin pipeline integration", () => {
     expect(parsed.params.text).toBe("I can help!");
     expect(parsed.params.reply_to).toBe(100);
 
-    await stop();
+    controller.abort();
+    await startPromise;
   });
 
   it("full round-trip: receive @mention → emit → reply via outbound", async () => {
-    const account = makeAccount(port);
     let capturedInbound: ClawPondInbound | null = null;
-    const deps = makeDeps((inbound) => { capturedInbound = inbound; });
+    const controller = new AbortController();
+    const { ctx, account, onReady } = makeCtx(port, {
+      abortSignal: controller.signal,
+      emitHandler: (inbound) => { capturedInbound = inbound; },
+    });
 
-    const { stop } = await gatewayAdapter.start(account, deps);
+    const startPromise = gatewayAdapter.startAccount(ctx);
     const outbound = createOutboundAdapter(() => getWsClient());
 
     const serverSocket = await new Promise<WsWebSocket>((resolve) =>
       wss.once("connection", (s) => resolve(s))
     );
-    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+    await new Promise<void>((r) => onReady.mockImplementation(r));
 
     connectNewRoom({ roomId: ROOM_ID, roomPassword: ROOM_PASSWORD });
     await new Promise((r) => setTimeout(r, 50));
@@ -261,20 +294,24 @@ describe("Full plugin pipeline integration", () => {
     expect(parsed.params.text).toBe("Round-trip reply");
     expect(parsed.params.reply_to).toBe(100);
 
-    await stop();
+    controller.abort();
+    await startPromise;
   });
 
   it("ignores messages not mentioning the agent", async () => {
-    const account = makeAccount(port);
     const emittedMessages: ClawPondInbound[] = [];
-    const deps = makeDeps((inbound) => emittedMessages.push(inbound));
+    const controller = new AbortController();
+    const { ctx, onReady } = makeCtx(port, {
+      abortSignal: controller.signal,
+      emitHandler: (inbound) => emittedMessages.push(inbound),
+    });
 
-    const { stop } = await gatewayAdapter.start(account, deps);
+    const startPromise = gatewayAdapter.startAccount(ctx);
 
     const serverSocket = await new Promise<WsWebSocket>((resolve) =>
       wss.once("connection", (s) => resolve(s))
     );
-    await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
+    await new Promise<void>((r) => onReady.mockImplementation(r));
 
     connectNewRoom({ roomId: ROOM_ID, roomPassword: ROOM_PASSWORD });
     await new Promise((r) => setTimeout(r, 50));
@@ -294,6 +331,7 @@ describe("Full plugin pipeline integration", () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(emittedMessages).toHaveLength(0);
-    await stop();
+    controller.abort();
+    await startPromise;
   });
 });

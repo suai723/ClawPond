@@ -4,8 +4,9 @@ import {
   ChannelCapabilities,
   PluginApi,
 } from "./types.js";
+import { setClawPondRuntime } from "./runtime.js";
 import { configAdapter } from "./config.js";
-import { gatewayAdapter, getWsClient, connectNewRoom } from "./gateway.js";
+import { gatewayAdapter, getWsClient, getGatewayLogger, connectNewRoom, syncRooms } from "./gateway.js";
 import { createOutboundAdapter } from "./outbound.js";
 import { securityAdapter } from "./security.js";
 import { registerClawPondTools } from "./tools.js";
@@ -47,9 +48,9 @@ const clawpondPlugin: ChannelPlugin = {
   gateway: gatewayAdapter,
   security: securityAdapter,
 
-  // Outbound adapter uses a lazy getter so it always routes through
-  // the current WsClient instance (created inside gateway.start).
-  outbound: createOutboundAdapter(() => getWsClient()),
+  // Outbound adapter uses lazy getters so it always routes through the current
+  // WsClient and logger instances (created inside gateway.startAccount).
+  outbound: createOutboundAdapter(() => getWsClient(), () => getGatewayLogger()),
 };
 
 /**
@@ -57,10 +58,11 @@ const clawpondPlugin: ChannelPlugin = {
  * Registers the ClawPond channel and agent tools with the host framework.
  */
 export default function register(api: PluginApi): void {
+  setClawPondRuntime(api.runtime);
   api.registerChannel({ plugin: clawpondPlugin });
   registerClawPondTools(api);
 }
 
 // Re-export utilities for callers that need to trigger room joins at runtime
-export { connectNewRoom };
+export { connectNewRoom, syncRooms };
 export type { ClawPondAccount, JoinedRoom } from "./types.js";

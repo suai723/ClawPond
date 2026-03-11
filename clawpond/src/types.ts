@@ -20,6 +20,8 @@ export interface ClawPondAccount {
   reconnectInterval: number;
   /** Maximum reconnect delay in ms (default: 30000) */
   maxReconnectDelay: number;
+  /** Pre-configured rooms to auto-join on connection (optional) */
+  rooms?: JoinedRoom[];
 }
 
 /** A room subscription passed to connectNewRoom() after HTTP join */
@@ -103,10 +105,26 @@ export interface ClawPondInbound {
   peerId: string;
   /** Always "group" for ClawPond rooms */
   peerKind: "group";
+  /**
+   * Optional session identifier for OpenClaw session routing.
+   * If not provided, OpenClaw will generate one based on channel + peerId.
+   */
+  sessionId?: string;
+  /**
+   * Session key used by OpenClaw for routing messages to the correct session.
+   * Format: agent:<agentId>:<channel>:<peerKind>:<peerId>
+   * Example: agent:main:clawpond:group:room-id-123
+   */
+  SessionKey?: string;
   replyTo?: number;
   attachments?: RelayAttachment[];
   metadata?: Record<string, unknown>;
   timestamp: Date;
+  /**
+   * Context needed for routing replies back to the correct room and message.
+   * Required by the outbound adapter to send responses.
+   */
+  replyContext: ReplyContext;
 }
 
 /** Context carried with each inbound message for routing the reply */
@@ -187,8 +205,29 @@ export interface GatewayDeps {
   onDisconnect: () => void;
 }
 
+/** Context passed by OpenClaw when starting a channel account (aligns with Feishu gateway.startAccount). */
+export interface GatewayStartAccountCtx {
+  cfg: OpenClawConfig;
+  accountId: string;
+  setStatus?: (status: { accountId: string; [k: string]: unknown }) => void;
+  log?: (msg: string, ...args: unknown[]) => void;
+  runtime?: {
+    log?: (msg: string, ...args: unknown[]) => void;
+    error?: (err: unknown) => void;
+    emit?: (event: string, data: unknown) => void;
+    onReady?: () => void;
+    onError?: (err: Error) => void;
+    onDisconnect?: () => void;
+  };
+  abortSignal?: AbortSignal;
+  emit?: (event: string, data: unknown) => void;
+  onReady?: () => void;
+  onError?: (err: Error) => void;
+  onDisconnect?: () => void;
+}
+
 export interface ChannelGatewayAdapter {
-  start: (account: ClawPondAccount, deps: GatewayDeps) => Promise<{ stop: () => Promise<void> }>;
+  startAccount: (ctx: GatewayStartAccountCtx) => Promise<void>;
 }
 
 export interface ChannelSecurityAdapter {

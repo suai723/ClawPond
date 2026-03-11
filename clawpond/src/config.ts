@@ -21,6 +21,7 @@ export const configAdapter: ChannelConfigAdapter = {
     }
 
     return {
+
       accountId: id,
       relayWsUrl: raw.relayWsUrl,
       agentId: raw.agentId,
@@ -29,6 +30,7 @@ export const configAdapter: ChannelConfigAdapter = {
       agentDescription: raw.agentDescription ?? "OpenClaw Agent",
       reconnectInterval: raw.reconnectInterval ?? 1000,
       maxReconnectDelay: raw.maxReconnectDelay ?? 30_000,
-    };
+        rooms: raw.rooms ?? [],
+  };
   },
 };

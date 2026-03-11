@@ -169,6 +169,7 @@ describe("ClawPondWsClient – joinRoom", () => {
 
     const parsed = JSON.parse(received);
     expect(parsed.method).toBe("joinRoom");
+    expect(parsed.params.room_id).toBe("room-001");
     expect(parsed.params.password).toBe("secret-password");
 
     await client.disconnectAll();
@@ -183,6 +184,9 @@ describe("ClawPondWsClient – joinRoom", () => {
     client.joinRoom("room-A", "pass-A");
     client.joinRoom("room-B", "pass-B");
 
+    expect(deps.logger.info).toHaveBeenCalledWith("clawpond_ws_room_queued", { roomId: "room-A" });
+    expect(deps.logger.info).toHaveBeenCalledWith("clawpond_ws_room_queued", { roomId: "room-B" });
+
     const receivedMessages: string[] = [];
     wss.once("connection", (serverSocket) => {
       serverSocket.on("message", (data) => receivedMessages.push(data.toString()));
@@ -193,7 +197,10 @@ describe("ClawPondWsClient – joinRoom", () => {
     await new Promise((r) => setTimeout(r, 50));
 
     const parsed = receivedMessages.map((m) => JSON.parse(m));
+    const roomIds = parsed.map((p) => p.params.room_id);
     const passwords = parsed.map((p) => p.params.password);
+    expect(roomIds).toContain("room-A");
+    expect(roomIds).toContain("room-B");
     expect(passwords).toContain("pass-A");
     expect(passwords).toContain("pass-B");
 
@@ -301,7 +308,7 @@ describe("ClawPondWsClient – sendMessage", () => {
 
     const result = client.sendMessage("room-001", "test");
     expect(result).toBe(false);
-    expect(deps.logger.warn).toHaveBeenCalledWith(
+    expect(deps.logger.info).toHaveBeenCalledWith(
       "clawpond_ws_send_failed_not_open",
       expect.objectContaining({ roomId: "room-001" })
     );
@@ -318,6 +325,10 @@ describe("ClawPondWsClient – sendMessage", () => {
 
     const result = client.sendMessage("room-001", "Hello");
     expect(result).toBe(true);
+    expect(deps.logger.info).toHaveBeenCalledWith(
+      "clawpond_ws_send_ok",
+      expect.objectContaining({ roomId: "room-001", textLength: 5 })
+    );
 
     await client.disconnectAll();
   });
@@ -445,7 +456,7 @@ describe("ClawPondWsClient – @mention detection", () => {
     expect(() => serverSocket.send("NOT_VALID_JSON")).not.toThrow();
     await new Promise((r) => setTimeout(r, 50));
 
-    expect(deps.logger.warn).toHaveBeenCalledWith(
+    expect(deps.logger.info).toHaveBeenCalledWith(
       "clawpond_ws_parse_error",
       expect.objectContaining({ error: expect.any(String) })
     );
@@ -594,6 +605,9 @@ describe("ClawPondWsClient – disconnectAll", () => {
     await new Promise<void>((r) => (deps.onReady as jest.Mock).mockImplementation(r));
 
     await client.disconnectAll();
+    expect(deps.logger.info).toHaveBeenCalledWith("clawpond_ws_disconnect_all", {
+      accountId: account.accountId,
+    });
     expect(client.sendMessage("room-001", "test")).toBe(false);
   });
 });

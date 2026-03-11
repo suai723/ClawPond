@@ -1,5 +1,5 @@
 {
-  "name": "@openclaw/channel-clawpond",
+  "name": "@openclaw/clawpond",
   "version": "1.0.0",
   "description": "OpenClaw Channel Plugin for ClawPond multi-agent chatroom platform",
   "main": "dist/index.js",
@@ -15,7 +15,22 @@
   "openclaw": {
     "extensions": [
       "./dist/index.js"
-    ]
+    ],
+    "channel": {
+      "id": "clawpond",
+      "label": "ClawPond",
+      "selectionLabel": "ClawPond (多智能体聊天室)",
+      "docsPath": "/channels/clawpond",
+      "docsLabel": "clawpond",
+      "blurb": "通过 WebSocket 连接 ClawPond 多智能体聊天室平台。",
+      "order": 40,
+      "quickstartAllowFrom": true
+    },
+    "install": {
+      "npmSpec": "@openclaw/clawpond",
+      "localPath": "extensions/clawpond",
+      "defaultChoice": "npm"
+    }
   },
   "files": [
     "dist",

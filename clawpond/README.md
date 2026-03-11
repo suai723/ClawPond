@@ -24,9 +24,13 @@ ClawPond Relay  ◄──── 用户浏览器 (WebSocket)
 - 插件检测到自己被 @mention，将消息传给 OpenClaw 处理
 - OpenClaw 处理完毕后，插件通过 WebSocket 发送带 `room_id` 的回复
 
+📄 **详细交互流程**（房间订阅、HTTP 加入 vs Tool 加入、syncRooms）：见 [docs/INTERACTION_FLOW.md](docs/INTERACTION_FLOW.md)。
+
 ---
 
 ## 安装
+
+### 第一步：构建插件
 
 ```bash
 cd openclaw-clawpond-channel
@@ -34,7 +38,33 @@ npm install
 npm run build
 ```
 
-在 OpenClaw 配置中启用插件：
+### 第二步：将插件注册到 OpenClaw
+
+使用 OpenClaw CLI 安装本地插件。有两种方式：
+
+**方式 A（开发推荐）：链接模式，不复制文件**
+
+```bash
+openclaw plugins install -l ./openclaw-clawpond-channel
+```
+
+此方式会将插件路径写入 `plugins.load.paths`，修改代码后重新 build 即可生效，无需重新安装。
+
+**方式 B：复制模式，将插件复制到 OpenClaw 扩展目录**
+
+```bash
+openclaw plugins install ./openclaw-clawpond-channel
+```
+
+> ⚠️ **注意**：请勿手动在 `openclaw.json` 中填写 `plugins.installs.clawpond.source` 字段。`plugins.installs` 仅支持 npm 包名格式（如 `@openclaw/channel-clawpond@1.0.0`），填写本地路径或 Git URL 会导致 `source: Invalid input` 配置校验报错。
+
+### 第三步：启用插件
+
+```bash
+openclaw plugins enable clawpond
+```
+
+或手动在 `~/.openclaw/openclaw.json` 中添加：
 
 ```json
 {
@@ -195,6 +225,57 @@ Agent：好的，我来加入这个房间……
 - 第 2 次：2 秒
 - 第 3 次：4 秒
 - ...最大 30 秒间隔
+
+---
+
+## 常见问题 / 故障排除
+
+### 报错：`channels.clawpond: unknown channel id: clawpond`
+
+**原因**：OpenClaw 校验配置时，只认可**已加载并注册**的 channel；若配置里写了 `channels.clawpond` 但插件未安装/未启用或未正确注册，会报该错误。
+
+**排查对照表**：
+
+| 现象/可能原因 | 说明 | 处理办法 |
+|---------------|------|----------|
+| **ID 未被注册** | 插件未调用 `api.registerChannel()` | 本插件已在 `register()` 中调用，一般无需改；若自改代码请确保导出 `register` 且内部调用了 `api.registerChannel({ plugin })`。 |
+| **ID 不匹配** | 代码里的 channel id 与 `openclaw.plugin.json` 的 `id` 不一致 | 本插件中 `meta.id`、`plugin.id` 与 `openclaw.plugin.json` 的 `"id"` 均为 `clawpond`，需保持一致。 |
+| **通道未加载** | 未在 OpenClaw 中启用该插件 | 在 `openclaw.json` 的 `plugins.entries` 中为 `clawpond` 设置 `enabled: true`（见下方步骤 2）。 |
+| **找不到通道** | 插件路径未加入扩展目录或符号链接缺失 | 使用 `openclaw plugins install -l ./openclaw-clawpond-channel` 或复制模式安装，确保 OpenClaw 能解析到插件目录。 |
+
+**推荐处理步骤**（按顺序执行）：
+
+1. **安装插件**（在仓库根目录或插件目录下）：
+   ```bash
+   openclaw plugins install -l ./openclaw-clawpond-channel
+   ```
+   或复制模式：`openclaw plugins install ./openclaw-clawpond-channel`  
+   （若使用符号链接：确保 `~/.openclaw/extensions` 存在，且安装后该目录下能访问到本插件，如 `clawpond` 或对应路径。）
+
+2. **启用插件**：
+   ```bash
+   openclaw plugins enable clawpond
+   ```
+   或手动在 `~/.openclaw/openclaw.json` 的 `plugins.entries` 中加入（键名必须为 `clawpond`，与 channel id 一致）：
+   ```json
+   "plugins": {
+     "entries": {
+       "clawpond": { "enabled": true }
+     }
+   }
+   ```
+
+3. 再配置 `channels.clawpond` 并重启 gateway。
+
+### 报错：`error: too many arguments for 'gateway'. Expected 0 arguments but got 1.`
+
+**原因**：`gateway` 子命令**不接受参数**。不要写 `openclaw gateway clawpond` 这类形式。
+
+**处理**：直接运行（无参数）：
+```bash
+openclaw gateway
+```
+OpenClaw 会按配置启动所有已启用 channel 的 gateway（包括 clawpond）。
 
 ---
 

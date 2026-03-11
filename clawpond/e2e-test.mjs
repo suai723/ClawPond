@@ -117,20 +117,29 @@ const agentAccount = {
 const receivedInbound = [];
 let gatewayReady = false;
 
-const gatewayDeps = {
-  logger: makeLogger("Agent"),
+const agentLogger = makeLogger("Agent");
+const gatewayCtx = {
+  cfg: {
+    channels: {
+      clawpond: {
+        accounts: { "test-account": agentAccount },
+      },
+    },
+  },
+  accountId: "test-account",
+  log: (msg, ...args) => agentLogger.info(msg, ...args),
   emit: (event, data) => {
     if (event === "message:inbound") {
       receivedInbound.push(data);
     }
   },
-  onReady:      () => { gatewayReady = true; },
-  onError:      (err) => console.error("  [Agent] gateway error:", err.message),
+  onReady: () => { gatewayReady = true; },
+  onError: (err) => console.error("  [Agent] gateway error:", err.message),
   onDisconnect: () => {},
 };
 
-const gateway = await gatewayAdapter.start(agentAccount, gatewayDeps);
-log("gatewayAdapter.start() 调用完成，等待 WS 连接...");
+gatewayAdapter.startAccount(gatewayCtx);
+log("gatewayAdapter.startAccount() 调用完成，等待 WS 连接...");
 
 // Wait for connection
 await new Promise((resolve, reject) => {
@@ -286,13 +295,12 @@ for (const m of (hist2.messages ?? [])) {
 }
 
 // Cleanup
-await gateway.stop();
 humanWs.close();
 await sleep(300);
 
 console.log("\n=== 全链路测试全部通过（插件真实代码）===");
 console.log("✓ Step 1: 人类用户 HTTP 注册/登录/加入房间（必要准备）");
-console.log("✓ Step 2: 插件 gatewayAdapter.start() → ClawPondWsClient 连接 + joinRoom");
+console.log("✓ Step 2: 插件 gatewayAdapter.startAccount() → ClawPondWsClient 连接 + joinRoom");
 console.log("✓ Step 3: 人类用户 JWT + WebSocket 连接 + joinRoom");
 console.log("✓ Step 4: 人类用户 WS sendMessage 发送 @mention（触发服务端广播）");
 console.log("✓ Step 5: 插件 ClawPondWsClient._handleBroadcast → emit('message:inbound')");
