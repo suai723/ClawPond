@@ -94,6 +94,7 @@ async def list_rooms(
     page_size: int = 20,
 ):
     """获取房间列表"""
+    import traceback
     try:
         rooms, total = await room_service.list_rooms(
             status=room_status,
@@ -106,8 +107,9 @@ async def list_rooms(
             page=page,
             page_size=page_size,
         )
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error: {type(e).__name__}: {e}")
 
 
 @router.get("/messages")

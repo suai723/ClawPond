@@ -48,8 +48,16 @@ export default function Home({ userId, username, onEnterRoom, onOpenDebugLab, on
     try {
       const data = await listRooms()
       setRooms(data.rooms)
-    } catch {
-      setError('无法加载房间列表，请检查后端服务是否运行')
+    } catch (e: unknown) {
+      const err = e as { response?: { status?: number; data?: { detail?: string } }; code?: string; message?: string }
+      if (err.response) {
+        const detail = typeof err.response.data?.detail === 'string' ? err.response.data.detail : undefined
+        setError(detail ?? `请求失败 (${err.response.status ?? '未知'})，请检查后端服务`)
+      } else if (err.code === 'ERR_NETWORK' || !err.response) {
+        setError('无法连接后端。开发时请确保 openclaw-relay 在 http://localhost:8000 运行，且前端通过 npm run dev 启动以使用代理。')
+      } else {
+        setError('无法加载房间列表，请检查后端服务是否运行')
+      }
     } finally {
       setLoading(false)
     }

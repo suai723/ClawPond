@@ -8,12 +8,8 @@ import { ClawPondWsClient } from "./ws-client.js";
 
 type Logger = GatewayDeps["logger"];
 
-const consoleLogger: Logger = {
-  debug: (msg, meta) => console.debug("[ClawPond Outbound]", msg, meta ?? ""),
-  info: (msg, meta) => console.log("[ClawPond Outbound]", msg, meta ?? ""),
-  warn: (msg, meta) => console.warn("[ClawPond Outbound]", msg, meta ?? ""),
-  error: (msg, meta) => console.error("[ClawPond Outbound]", msg, meta ?? ""),
-};
+const noop = (_msg: string, _meta?: Record<string, unknown>) => {};
+const noopLogger: Logger = { debug: noop, info: noop, warn: noop, error: noop };
 
 /**
  * Resolve the ClawPond roomId from the outbound target.
@@ -49,7 +45,16 @@ export function createOutboundAdapter(
   getClient: () => ClawPondWsClient | null,
   getLogger?: () => Logger | null,
 ): ChannelOutboundAdapter {
-  const log = (): Logger => getLogger?.() ?? consoleLogger;
+  // Proxy logger: delegates lazily to getLogger() at call-time (gateway may not
+  // be started yet when this adapter is constructed), but lets call-sites write
+  // logger.info(...) exactly like deps.logger.info(...) in gateway.ts.
+  // Falls back to noop so logs never leak to the console.
+  const logger: Logger = {
+    debug: (msg, meta) => (getLogger?.() ?? noopLogger).debug(msg, meta),
+    info:  (msg, meta) => (getLogger?.() ?? noopLogger).info(msg, meta),
+    warn:  (msg, meta) => (getLogger?.() ?? noopLogger).warn(msg, meta),
+    error: (msg, meta) => (getLogger?.() ?? noopLogger).error(msg, meta),
+  };
 
   return {
     deliveryMode: "direct",
@@ -59,7 +64,7 @@ export function createOutboundAdapter(
 
       const roomId = resolveRoomId(target);
       if (!roomId) {
-        log().error("clawpond_outbound_no_room", {
+        logger.error("clawpond_outbound_no_room", {
           targetId: target.id,
           hasReplyContext: !!target.replyContext,
         });
@@ -70,7 +75,7 @@ export function createOutboundAdapter(
       const replyToMessageId =
         target.replyContext?.messageId ?? replyTo?.messageId;
 
-      log().info("clawpond_outbound_send", {
+      logger.info("clawpond_outbound_send", {
         roomId,
         replyToMessageId,
         textLength: text.length,
@@ -78,17 +83,17 @@ export function createOutboundAdapter(
 
       const client = getClient();
       if (!client) {
-        log().error("clawpond_outbound_no_client", { roomId });
+        logger.error("clawpond_outbound_no_client", { roomId });
         return { ok: false, error: "ClawPond WsClient is not initialised" };
       }
 
       const sent = client.sendMessage(roomId, text, replyToMessageId);
       if (!sent) {
-        log().warn("clawpond_outbound_send_failed", { roomId });
+        logger.warn("clawpond_outbound_send_failed", { roomId });
         return { ok: false, error: `WebSocket for room ${roomId} is not open` };
       }
 
-      log().info("clawpond_outbound_send_ok", { roomId });
+      logger.info("clawpond_outbound_send_ok", { roomId });
       return { ok: true };
     },
   };
