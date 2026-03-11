@@ -1,0 +1,136 @@
+{
+    "meta": {
+      "lastTouchedVersion": "2026.3.9",
+      "lastTouchedAt": "2026-03-11T06:17:05.427Z"
+    },
+    "wizard": {
+      "lastRunAt": "2026-03-11T06:10:55.975Z",
+      "lastRunVersion": "2026.3.9",
+      "lastRunCommand": "onboard",
+      "lastRunMode": "local"
+    },
+    "auth": {
+      "profiles": {
+        "openrouter:default": {
+          "provider": "openrouter",
+          "mode": "api_key"
+        }
+      }
+    },
+    "agents": {
+      "defaults": {
+        "model": {
+          "primary": "openrouter/deepseek/deepseek-v3.2"
+        },
+        "models": {
+          "openrouter/auto": {
+            "alias": "OpenRouter"
+          },
+          "openrouter/deepseek/deepseek-v3.2": {}
+        },
+        "workspace": "/home/node/.openclaw/workspace",
+        "compaction": {
+          "mode": "safeguard"
+        }
+      }
+    },
+    "tools": {
+      "profile": "coding"
+    },
+    "commands": {
+      "native": "auto",
+      "nativeSkills": "auto",
+      "restart": true,
+      "ownerDisplay": "raw"
+    },
+    "session": {
+      "dmScope": "per-channel-peer"
+    },
+    "hooks": {
+      "internal": {
+        "enabled": true,
+        "entries": {
+          "boot-md": {
+            "enabled": true
+          },
+          "bootstrap-extra-files": {
+            "enabled": true
+          },
+          "command-logger": {
+            "enabled": true
+          },
+          "session-memory": {
+            "enabled": true
+          }
+        }
+      }
+    },
+    "gateway": {
+      "port": 18789,
+      "mode": "local",
+      "bind": "loopback",
+      "controlUi": {
+        "allowedOrigins": [
+          "http://127.0.0.1:18789"
+        ]
+      },
+      "auth": {
+        "mode": "token",
+        "token": "dee76ce712308aca1a99d488a73539d073183772134644b704cfdd78666c9dd9"
+      },
+      "tailscale": {
+        "mode": "off",
+        "resetOnExit": false
+      },
+      "nodes": {
+        "denyCommands": [
+          "camera.snap",
+          "camera.clip",
+          "screen.record",
+          "contacts.add",
+          "calendar.add",
+          "reminders.add",
+          "sms.send"
+        ]
+      }
+    },
+    "plugins": {
+      "allow": [
+        "clawpond"
+      ],
+      "entries": {
+        "clawpond": {
+          "enabled": true
+        }
+      },
+      "installs": {
+        "clawpond": {
+          "source": "archive",
+          "sourcePath": "/home/node/.openclaw/openclaw-clawpond-channel.tar",
+          "installPath": "/home/node/.openclaw/extensions/clawpond",
+          "version": "1.0.0",
+          "installedAt": "2026-03-11T06:17:05.406Z"
+        }
+      }
+    },
+    "channels": {
+      "clawpond": {
+        "enabled": true,
+        "accounts": {
+          "default": {
+            "relayWsUrl": "ws://host.docker.internal:8000",
+            "agentId": "4be75f08-56a3-420a-a1e7-54015bfa2625",
+            "agentSecret": "Kv3nNhwob9_Gcgbch9obppnKmhjhIJWRGEmkrMme4Qs",
+            "agentName": "moly",
+            "agentDescription": "OpenClaw AI Agent",
+            "rooms": [
+              {
+                "roomId": "7ee7eb0c-022d-4452-99ec-6b2d4a0b7e40",
+                "roomPassword": "uWaDSaHQCOkEo7jtoRnsyw"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
